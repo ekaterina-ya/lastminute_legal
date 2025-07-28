@@ -1,0 +1,8 @@
+python-telegram-bot
+google-generativeai
+pandas
+numpy
+Pillow
+tqdm
+pytz
+python-dotenv
