@@ -55,7 +55,7 @@ DB_PATH = os.getenv('DATABASE_PATH', 'data/user_data.db')
 CHANNEL_URL = os.getenv('TELEGRAM_CHANNEL_URL')
 
 # --- Настройки бота ---
-DAILY_LIMIT = 5
+DAILY_LIMIT = 10
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 CONSECUTIVE_BLOCK_LIMIT = 3
 TOTAL_BLOCK_LIMIT = 5
