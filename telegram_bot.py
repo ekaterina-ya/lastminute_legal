@@ -406,8 +406,45 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reset_consecutive_blocks(user.id)
         
         user_logger.info(f"[ПРОМПТ 1 РЕЗУЛЬТАТ] {analysis_result.get('preprocessed_text', 'N/A')}")
+        # %% Вставка после обработки первого промпта
+        first_output = analysis_result.get('preprocessed_text', "")
+
+        if isinstance(first_output, str) and first_output.strip().startswith("500 An internal error has occurred"):
+            apology_text = (
+                "Приносим извинения, бот не выдает заключение из-за проблем на стороне Google. Обычно они решаются достаточно быстро. Попробуйте загрузить креатив позднее."
+            )
+            keyboard = [
+                [InlineKeyboardButton("✅ Проверить креатив ещё раз", callback_data="check_another")],
+                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                apology_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
+            )
+            context.user_data['is_processing'] = False
+            return
+
         final_output = analysis_result.get('final_output', "Произошла непредвиденная ошибка при анализе.")
         user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ] {final_output}")
+        # %% Вставка после получения final_output
+        if isinstance(final_output, str) and final_output.strip().startswith("500 An internal error has occurred"):
+            apology_text = (
+                 "Приносим извинения, бот не выдает заключение из-за проблем на стороне Google. Обычно они решаются достаточно быстро. Попробуйте загрузить креатив позднее."
+            )
+            keyboard = [
+                [InlineKeyboardButton("✅ Проверить креатив ещё раз", callback_data="check_another")],
+                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                apology_text,
+                reply_markup=reply_markup,
+                parse_mode=ParseMode.HTML
+            )
+            context.user_data['is_processing'] = False
+            return
 
         header = "### Заключение по рекламному материалу\n\n"
         full_message = final_output
