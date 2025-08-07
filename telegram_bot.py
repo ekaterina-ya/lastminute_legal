@@ -390,7 +390,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         user_logger.info("Запуск анализа бэкендом...")
         analysis_result = await backend.analyze_creative_flow(
-            file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path, original_filename=file_name
+            file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path, original_filename=file_name, user_id=user.id, user_logger=user_logger
         )
         
         if analysis_result.get('safety_violation'):
@@ -660,7 +660,7 @@ def main() -> None:
         return
 
     init_db()
-    backend.initialize_backend()
+    backend.initialize_backend(LOGS_DIR)
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     

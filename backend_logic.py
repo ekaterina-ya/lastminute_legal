@@ -8,6 +8,7 @@ import google.generativeai as genai
 import re
 from PIL import Image
 import io
+import logging
 
 # --- Глобальные переменные для кеширования ---
 rag_df = None
@@ -18,6 +19,8 @@ generative_model = None
 PROMPT_1_PREPROCESSING = None
 PROMPT_2_ANALYSIS = None
 RAG_TOP_N = 5
+USER_FILES_DIR = None
+FILE_COUNTER_PATH = None
 
 def load_env_variable(var_name, is_int=False, default=None):
     """Загружает переменную окружения."""
@@ -34,16 +37,30 @@ def load_prompt_from_file(file_path):
     except FileNotFoundError:
         raise ValueError(f"КРИТИЧЕСКАЯ ОШИБКА: Файл с промптом не найден по пути '{file_path}'.")
 
-def initialize_backend():
+def initialize_backend(logs_dir_path: str):
     """
     Загружает все необходимые данные и модели в память при старте.
     Эта функция вызывается один раз при запуске бота.
     """
     global rag_df, corpus_embeddings, doc_to_case_map, embedding_model, generative_model
     global PROMPT_1_PREPROCESSING, PROMPT_2_ANALYSIS, RAG_TOP_N
+    global USER_FILES_DIR, FILE_COUNTER_PATH
 
     print("Инициализация бэкенда...")
     
+     # --- Инициализация путей для сохранения файлов и счетчика ---
+    USER_FILES_DIR = os.path.join(logs_dir_path, 'user_files')
+    FILE_COUNTER_PATH = os.path.join(logs_dir_path, 'file_counter.txt')
+
+    if not os.path.exists(USER_FILES_DIR):
+        os.makedirs(USER_FILES_DIR)
+        print(f"Создана директория для файлов: {USER_FILES_DIR}")
+
+    if not os.path.exists(FILE_COUNTER_PATH):
+        with open(FILE_COUNTER_PATH, 'w') as f:
+            f.write('0')
+        print(f"Создан файл счетчика: {FILE_COUNTER_PATH}")
+        
     # --- Загрузка конфигурации ---
     API_KEY = load_env_variable('GEMINI_API_KEY')
     RAG_DATA_PATH = load_env_variable('RAG_DATA_PATH')
@@ -76,6 +93,22 @@ def initialize_backend():
 # ===============================================================
 # БЛОК 2: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ===============================================================
+
+def get_and_increment_file_counter() -> int:
+    """Читает, инкрементирует и сохраняет глобальный счетчик файлов."""
+    try:
+        with open(FILE_COUNTER_PATH, 'r+') as f:
+            current_count = int(f.read().strip() or 0)
+            new_count = current_count + 1
+            f.seek(0)
+            f.write(str(new_count))
+            f.truncate()
+            return new_count
+    except (IOError, ValueError) as e:
+        print(f"Ошибка при работе с файлом счетчика {FILE_COUNTER_PATH}: {e}. Сбрасываю на 1.")
+        with open(FILE_COUNTER_PATH, 'w') as f:
+            f.write('1')
+        return 1
 
 def resize_image(image_bytes: bytes, max_size_px: int = 1024, quality: int = 85) -> Image.Image:
     """Изменяет размер изображения до max_size_px по большей стороне."""
@@ -213,7 +246,7 @@ def postprocess_final_answer(final_text):
 # ===============================================================
 # БЛОК 4: ГЛАВНАЯ ФУНКЦИЯ (ТОЧКА ВХОДА ДЛЯ БОТА)
 # ===============================================================
-async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None, original_filename=None) -> dict:
+async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None, original_filename=None, user_id: int = None, user_logger: logging.Logger = None) -> dict:
     """
     Основной пайплайн анализа. Принимает данные от бота, возвращает словарь с результатом.
     """
@@ -230,6 +263,16 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
     else:
         if file_bytes:
             image_obj = resize_image(file_bytes)
+            if image_obj and user_id and user_logger:
+                try:
+                    file_count = get_and_increment_file_counter()
+                    new_filename = f"{user_id}_{file_count}.jpg"
+                    save_path = os.path.join(USER_FILES_DIR, new_filename)
+                    image_obj.save(save_path, 'JPEG', quality=85)
+                    user_logger.info(f"Обработанный файл сохранен по пути: {save_path}")
+                except Exception as e:
+                    print(f"❗️ Ошибка при сохранении файла для пользователя {user_id}: {e}")
+                    user_logger.error(f"Не удалось сохранить обработанный файл: {e}")
         user_content_for_api = build_user_content(image=image_obj, text=text_content)
     
     # 1. Предварительная обработка
