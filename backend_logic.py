@@ -138,7 +138,7 @@ SAFETY_SETTINGS = {
     "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_ONLY_HIGH",
 }
 
-def preprocess_content(user_content):
+def preprocess_content(user_content, user_logger: logging.Logger = None):
     """Шаг 1: Предварительная обработка (описание картинки, очистка текста)."""
     print("Шаг 1: Предварительная обработка контента...")
     try:
@@ -158,6 +158,10 @@ def preprocess_content(user_content):
             content_for_api, 
             safety_settings=SAFETY_SETTINGS
         )
+        
+        if user_logger and hasattr(response, 'usage_metadata'):
+            user_logger.info(f"[API METRICS - Preprocessing] {response.usage_metadata}")
+            
         if not response.parts:
              print("❗️ Запрос заблокирован системой безопасности Gemini.")
              return {"error": "safety_block", "message": "Контент заблокирован системой безопасности."}
@@ -166,7 +170,7 @@ def preprocess_content(user_content):
         print(f"❗️ Ошибка на этапе предварительной обработки: {e}")
         return {"error": "processing_error", "message": str(e)}
 
-def semantic_search(query_text: str):
+def semantic_search(query_text: str, user_logger: logging.Logger = None):
     """Шаг 2: Семантический поиск релевантных кейсов."""
     print(f"Шаг 2: Поиск {RAG_TOP_N} релевантных кейсов...")
     try:
@@ -177,6 +181,22 @@ def semantic_search(query_text: str):
         )
         query_embedding = np.array(result['embedding']).reshape(1, -1)
         similarities = np.dot(corpus_embeddings, query_embedding.T).flatten()
+
+        top_10_indices_for_logging = np.argsort(similarities)[-10:][::-1]
+        
+        if user_logger:
+            log_message = ["[SEMANTIC SEARCH] Топ-10 релевантных дел:"]
+            top_10_results = rag_df.iloc[top_10_indices_for_logging]
+            for index, row in top_10_results.iterrows():
+                similarity_score = similarities[index]
+                log_message.append(
+                    f"  - CaseID: {row.get('caseID', 'N/A')}, "
+                    f"Cosine Similarity: {similarity_score:.4f}"
+                )
+            user_logger.info('\n'.join(log_message))
+        
+        top_n_indices = top_10_indices_for_logging[:RAG_TOP_N]
+
         top_n_indices = np.argsort(similarities)[-RAG_TOP_N:][::-1]
         return rag_df.iloc[top_n_indices].copy()
     except Exception as e:
@@ -198,13 +218,21 @@ def format_rag_context(search_results_df):
         )
     return "\n---\n".join(context_parts)
 
-def get_final_analysis(processed_text, rag_context):
+def get_final_analysis(processed_text, rag_context, user_logger: logging.Logger = None):
     """Шаг 3: Генерация финального заключения."""
     print("Шаг 3: Генерация финального юридического заключения...")
     try:
         final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
         final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
+
+        if user_logger:
+            user_logger.info(f"[ПРОМПТ 2 (ФИНАЛЬНЫЙ)]\n{final_prompt}")
+            
         response = generative_model.generate_content(final_prompt, safety_settings=SAFETY_SETTINGS)
+
+        if user_logger and hasattr(response, 'usage_metadata'):
+            user_logger.info(f"[API METRICS - Final Analysis] {response.usage_metadata}")
+            
         if not response.parts:
             return "Ошибка: Финальный анализ был заблокирован системой безопасности. Если вы уверены, что бот ошибся, не допустив креатив к проверке, попробуйте отправить его повторно или перезапустите бота командой /start."
         return response.text
@@ -276,7 +304,7 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         user_content_for_api = build_user_content(image=image_obj, text=text_content)
     
     # 1. Предварительная обработка
-    processed_text_result = preprocess_content(user_content_for_api)
+    processed_text_result = preprocess_content(user_content_for_api, user_logger=user_logger)
     
     # Проверяем, вернулся ли словарь с ошибкой от preprocess_content
     if isinstance(processed_text_result, dict):
@@ -289,11 +317,11 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
     processed_text = processed_text_result
     
     # 2. Поиск в RAG
-    rag_results = semantic_search(processed_text)
+    rag_results = semantic_search(processed_text, user_logger=user_logger)
     rag_context = format_rag_context(rag_results)
     
     # 3. Финальный анализ
-    final_text = get_final_analysis(processed_text, rag_context)
+    final_text = get_final_analysis(processed_text, rag_context, user_logger=user_logger)
     if "Ошибка:" in final_text:
         return {"final_output": final_text, "preprocessed_text": processed_text, "safety_violation": False}
     

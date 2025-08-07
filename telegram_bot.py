@@ -363,6 +363,11 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         text_content = update.message.text or update.message.caption or ""
         file_bytes, file_name = None, None
+
+        if text_content:
+            user_logger.info(f"Получено текстовое сообщение: {text_content}")
+        else:
+            user_logger.info("Текстовое сообщение отсутствует, получен только файл.")
         
         if update.message.photo:
             photo = update.message.photo[-1]
@@ -496,7 +501,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
     except Exception as e:
         logger.error(f"Критическая ошибка в handle_creative для user {user.id}: {e}", exc_info=True)
-        user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В handle_creative: {e}", exc_info=True)
         await update.message.reply_text("Произошла внутренняя ошибка. Мы уже работаем над ее исправлением. Пожалуйста, попробуйте позже.")
         if ADMIN_USER_ID:
             await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id}!\nОшибка: {e}")
