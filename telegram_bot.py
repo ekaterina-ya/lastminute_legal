@@ -184,6 +184,16 @@ def get_remaining_requests(user_id: int) -> int:
             return DAILY_LIMIT - count
     return DAILY_LIMIT
 
+def unblock_user_in_db(user_id: int):
+    """Снимает блокировку с пользователя и сбрасывает счетчики нарушений."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # Устанавливаем is_blocked=0 и обнуляем счетчики, чтобы у пользователя был чистый старт
+    cursor.execute("UPDATE users SET is_blocked = 0, consecutive_blocks = 0, total_blocks = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    logger.info(f"Администратор снял блокировку с пользователя {user_id}.")
+    
 # ===============================================================
 # БЛОК 3: КОМАНДЫ И ОСНОВНЫЕ ОБРАБОТЧИКИ
 # ===============================================================
@@ -507,7 +517,31 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id}!\nОшибка: {e}")
     finally:
         context.user_data['is_processing'] = False
-            
+
+async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /unblock, доступный только администратору."""
+    admin_id = os.getenv('ADMIN_USER_ID')
+    user_id_to_check = str(update.effective_user.id)
+
+    # Проверка: команду может использовать только администратор
+    if not admin_id or user_id_to_check != admin_id:
+        logger.warning(f"Попытка несанкционированного доступа к команде /unblock от пользователя {user_id_to_check}")
+        return
+
+    # Проверяем, что команда передана с аргументом (ID пользователя)
+    if not context.args:
+        await update.message.reply_text("Ошибка: укажите ID пользователя для разблокировки.\nПример: `/unblock 123456789`")
+        return
+
+    try:
+        user_id_to_unblock = int(context.args[0])
+        unblock_user_in_db(user_id_to_unblock)
+        await update.message.reply_text(f"✅ Пользователь с ID {user_id_to_unblock} успешно разблокирован.")
+    except (ValueError, IndexError):
+        await update.message.reply_text("Ошибка: ID пользователя должен быть числом.")
+    except Exception as e:
+        await update.message.reply_text(f"Произошла ошибка при разблокировке: {e}")
+        
 # ===============================================================
 # БЛОК 4: ЛОГИКА ОБРАТНОЙ СВЯЗИ (CONVERSATION HANDLER)
 # ===============================================================
@@ -694,6 +728,7 @@ def main() -> None:
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("unblock", unblock_command))
     application.add_handler(feedback_conv_handler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_creative))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_creative))
