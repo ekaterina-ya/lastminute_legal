@@ -53,6 +53,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
 DB_PATH = os.getenv('DATABASE_PATH', 'data/user_data.db')
 CHANNEL_URL = os.getenv('TELEGRAM_CHANNEL_URL')
+ADMIN_CONTACT_URL = os.getenv('ADMIN_CONTACT_URL')
 
 # --- Настройки бота ---
 DAILY_LIMIT = 10
@@ -406,17 +407,27 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         error_type = analysis_result.get("error_type")
 
         if error_type == "safety":
-            # 3.1, 3.2, 3.3: Нарушение безопасности
-            handle_safety_violation(user.id, user.username) # Увеличиваем счетчик нарушений
-            keyboard = [
-                [InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="check_another")],
-                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                "Нейросеть считает, что вы направили недопустимый запрос. Она может ошибаться и при повторном рассмотрении предоставить заключение. Попробуйте еще раз позднее.",
-                reply_markup=reply_markup
-            )
+            # Нарушение безопасности: увеличиваем счетчик и проверяем, не пора ли блокировать
+            was_just_blocked = handle_safety_violation(user.id, user.username)
+
+            if was_just_blocked:
+                # Пользователь только что был заблокирован
+                block_text = "Ваш доступ к боту был заблокирован. Нейросеть может ошибаться в своей оценке загруженного вами контента. Если вы считаете, что произошла ошибка, свяжитесь с администратором."
+                keyboard = []
+                if ADMIN_CONTACT_URL:
+                     keyboard.append([InlineKeyboardButton("Связаться с администратором", url=ADMIN_CONTACT_URL)])
+                
+                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+                await update.message.reply_text(block_text, reply_markup=reply_markup)
+            else:
+                # Еще не заблокирован, просто предупреждение
+                warning_text = "Нейросеть считает, что вы направили недопустимый запрос. Она может ошибаться и при повторном рассмотрении предоставить заключение. Попробуйте еще раз позднее"
+                keyboard = [
+                    [InlineKeyboardButton("✅ Проверить креатив ещё раз", callback_data="check_another")],
+                    [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text(warning_text, reply_markup=reply_markup)
 
         elif error_type == "technical":
             # 4.1, 4.2, 4.4: Техническая ошибка
