@@ -57,8 +57,8 @@ CHANNEL_URL = os.getenv('TELEGRAM_CHANNEL_URL')
 # --- Настройки бота ---
 DAILY_LIMIT = 10
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
-CONSECUTIVE_BLOCK_LIMIT = 3
-TOTAL_BLOCK_LIMIT = 5
+CONSECUTIVE_BLOCK_LIMIT = 7
+TOTAL_BLOCK_LIMIT = 15
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
 # --- Состояния для ConversationHandler (опрос обратной связи) ---
@@ -299,7 +299,7 @@ async def learn_more(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         4. файлы в интерфейсе Telegram можно загружать как файлы (но тогда не получится загрузить сделанное на iPhone фото — их стандартный формат HEIC) или как изображения (тогда фото с iPhone пройдет — Telegram сам их конвертирует в нужный формат);
         5. лимит знаков загружаемых текстов соответствует установленному Telegram лимиту для 1 сообщения. 
 
-В боте установлена защита от непристойного контента, нарушающего нормы морали и этики. 3 загрузки такого контента подряд или 5 загрузок в общей сложности влекут <b>блокировку</b> и невозможность использовать бот. Если вы уверены в том, что произошла ошибка, и контент ошибочно распознан как непристойный, вы можете связаться с автором проекта через <a href="https://t.me/delay_RAG">Telegram-канал</a>.
+В боте установлена защита от непристойного контента, нарушающего нормы морали и этики. 7 загрузки такого контента подряд или 15 загрузок в общей сложности влекут <b>блокировку</b> и невозможность использовать бот. Нейросеть может ошибаться на этапе фильтрации и быть слишком строга, мы рекомендуем попробовать загрузить тот же креатив еще раз позднее. Если бот сообщает о блокировке, но вы уверены в том, что произошла ошибка, и контент ошибочно распознан как непристойный, вы можете связаться с автором проекта через <a href="https://t.me/delay_RAG">Telegram-канал</a>.
 
 В целом приглашаем вас присоединиться к <a href="https://t.me/delay_RAG">каналу</a>! Он может быть интересен юристам, энтузиастам ИИ, и тем, кто интересуется low-code разработкой. Как оказалось, создание даже такого небольшого pet-проекта — весёлый и нюансированный процесс, о котором интересно рассказать. 
 Мы хотели создать доступный инструмент, который сделает деятельность рекламщиков, юристов и предпринимателей более эффективной, поэтому очень ценим обратную связь, конструктивную критику и предложения о сотрудничестве."""
@@ -339,7 +339,7 @@ async def check_another(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
 
 async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Главный обработчик креативов с логикой блокировки и точными ответами."""
+    """Главный обработчик креативов с новой логикой обработки ошибок."""
     user = update.message.from_user
     user_logger = setup_user_logger(user.id)
 
@@ -350,6 +350,12 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not context.user_data.get('awaiting_creative', False):
         user_logger.warning("Попытка отправить креатив без получения разрешения (из главного меню).")
         await update.message.reply_text("Пожалуйста, нажмите на одну из кнопок, чтобы продолжить.")
+        return
+
+    # Предварительная проверка лимита, без списания
+    if get_remaining_requests(user.id) <= 0:
+        await update.message.reply_text("Лимит на сегодня исчерпан. Спасибо за доверие, буду рад помочь завтра!")
+        user_logger.warning("Попытка запроса при исчерпанном лимите.")
         return
 
     context.user_data['is_processing'] = True
@@ -363,22 +369,11 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         user_logger.info(f"--- Новый запрос от пользователя {user.first_name} (@{user.username}) ---")
 
-        can_request, remaining = check_and_update_limit(user.id)
-        if not can_request:
-            await update.message.reply_text("Лимит на сегодня исчерпан. Спасибо за доверие, буду рад помочь завтра!")
-            user_logger.warning("Попытка запроса при исчерпанном лимите.")
-            return 
-
         await update.message.reply_text("Креатив принят в работу, подготовка ответа может занять до 5 минут ⏳")
         
         text_content = update.message.text or update.message.caption or ""
         file_bytes, file_name = None, None
 
-        if text_content:
-            user_logger.info(f"Получено текстовое сообщение: {text_content}")
-        else:
-            user_logger.info("Текстовое сообщение отсутствует, получен только файл.")
-        
         if update.message.photo:
             photo = update.message.photo[-1]
             file_id = photo.file_id
@@ -398,121 +393,109 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     file_bytes = bytes(await new_file.download_as_bytearray())
             else:
                 await update.message.reply_text("Ошибка: поддерживаются только файлы .jpg, .png и .pdf.")
-                return 
+                return
         
         if not file_bytes and not text_content and not temp_file_path:
-            return 
+            return
 
         user_logger.info("Запуск анализа бэкендом...")
         analysis_result = await backend.analyze_creative_flow(
             file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path, original_filename=file_name, user_id=user.id, user_logger=user_logger
         )
         
-        if analysis_result.get('safety_violation'):
-            was_just_blocked = handle_safety_violation(user.id, user.username)
-            if was_just_blocked:
-                await update.message.reply_text("Ваш аккаунт был заблокирован за многократные попытки отправки недопустимого контента.")
-            else:
-                keyboard = [[InlineKeyboardButton("✅ Проверить еще один креатив", callback_data="check_another")]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await update.message.reply_text("Вы направили недопустимый запрос. Пожалуйста, убедитесь, что ваш контент соответствует правилам.", reply_markup=reply_markup)
-            return
+        error_type = analysis_result.get("error_type")
 
-        reset_consecutive_blocks(user.id)
-        
-        user_logger.info(f"[ПРОМПТ 1 РЕЗУЛЬТАТ] {analysis_result.get('preprocessed_text', 'N/A')}")
-        # %% Вставка после обработки первого промпта
-        first_output = analysis_result.get('preprocessed_text', "")
-
-        if isinstance(first_output, str) and first_output.strip().startswith("500 An internal error has occurred"):
-            apology_text = (
-                "Приносим извинения, бот не выдает заключение из-за проблем на стороне Google. Обычно они решаются достаточно быстро. Попробуйте загрузить креатив позднее."
-            )
+        if error_type == "safety":
+            # 3.1, 3.2, 3.3: Нарушение безопасности
+            handle_safety_violation(user.id, user.username) # Увеличиваем счетчик нарушений
             keyboard = [
-                [InlineKeyboardButton("✅ Проверить креатив ещё раз", callback_data="check_another")],
+                [InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="check_another")],
                 [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
-                apology_text,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.HTML
+                "Нейросеть считает, что вы направили недопустимый запрос. Она может ошибаться и при повторном рассмотрении предоставить заключение. Попробуйте еще раз позднее.",
+                reply_markup=reply_markup
             )
-            context.user_data['is_processing'] = False
-            return
 
-        final_output = analysis_result.get('final_output', "Произошла непредвиденная ошибка при анализе.")
-        user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ] {final_output}")
-        # %% Вставка после получения final_output
-        if isinstance(final_output, str) and final_output.strip().startswith("500 An internal error has occurred"):
-            apology_text = (
-                 "Приносим извинения, бот не выдает заключение из-за проблем на стороне Google. Обычно они решаются достаточно быстро. Попробуйте загрузить креатив позднее."
-            )
-            keyboard = [
-                [InlineKeyboardButton("✅ Проверить креатив ещё раз", callback_data="check_another")],
-                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                apology_text,
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.HTML
-            )
-            context.user_data['is_processing'] = False
-            return
-
-        header = "### Заключение по рекламному материалу\n\n"
-        full_message = final_output
-
-        keyboard = [
-            [InlineKeyboardButton("✅ Проверить еще один креатив", callback_data="check_another")],
-            [InlineKeyboardButton("✍️ Дать обратную связь", callback_data="give_feedback")],
-            [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        TELEGRAM_MAX_LENGTH = 4000
-        
-        if len(full_message) <= TELEGRAM_MAX_LENGTH:
-            await update.message.reply_text(
-                full_message, 
-                reply_markup=reply_markup, 
-                parse_mode=ParseMode.HTML, 
-                disable_web_page_preview=True
-            )
-        else:
-            parts = []
-            current_part = ""
-            for line in full_message.splitlines(True):
-                if len(current_part) + len(line) > TELEGRAM_MAX_LENGTH:
-                    parts.append(current_part)
-                    current_part = line
-                else:
-                    current_part += line
-            parts.append(current_part)
-
-            for part in parts[:-1]:
-                if part.strip():
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id, 
-                        text=part, 
-                        parse_mode=ParseMode.HTML, 
-                        disable_web_page_preview=True
-                    )
+        elif error_type == "technical":
+            # 4.1, 4.2, 4.4: Техническая ошибка
+            error_message = analysis_result.get("message", "Неизвестная ошибка")
+            logger.error(f"Техническая ошибка в backend для user {user.id}: {error_message}")
+            if ADMIN_USER_ID:
+                await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде у пользователя {user.id}!\nОшибка: {error_message}")
             
-            if parts[-1].strip():
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id, 
-                    text=parts[-1], 
+            keyboard = [
+                [InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="check_another")],
+                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(
+                "Приносим извинения, бот не выдает заключение из-за проблем на стороне Google. Обычно они решаются достаточно быстро. Попробуйте загрузить креатив позднее.",
+                reply_markup=reply_markup
+            )
+
+        else:
+            # 2: Успешное выполнение
+            check_and_update_limit(user.id) # Списываем лимит только при успехе
+            reset_consecutive_blocks(user.id)
+            
+            user_logger.info(f"[ПРОМПТ 1 РЕЗУЛЬТАТ] {analysis_result.get('preprocessed_text', 'N/A')}")
+            final_output = analysis_result.get('final_output', "Произошла внутренняя ошибка. Пожалуйста, попробуйте позже.")
+            user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ] {final_output}")
+            
+            full_message = final_output
+            
+            keyboard = [
+                [InlineKeyboardButton("✅ Проверить еще один креатив", callback_data="check_another")],
+                [InlineKeyboardButton("✍️ Дать обратную связь", callback_data="give_feedback")],
+                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            TELEGRAM_MAX_LENGTH = 4000
+            
+            if len(full_message) <= TELEGRAM_MAX_LENGTH:
+                await update.message.reply_text(
+                    full_message, 
                     reply_markup=reply_markup, 
                     parse_mode=ParseMode.HTML, 
                     disable_web_page_preview=True
                 )
-        
+            else:
+                parts = []
+                current_part = ""
+                for line in full_message.splitlines(True):
+                    if len(current_part) + len(line) > TELEGRAM_MAX_LENGTH:
+                        parts.append(current_part)
+                        current_part = line
+                    else:
+                        current_part += line
+                parts.append(current_part)
+
+                for part in parts[:-1]:
+                    if part.strip():
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id, 
+                            text=part, 
+                            parse_mode=ParseMode.HTML, 
+                            disable_web_page_preview=True
+                        )
+                
+                if parts[-1].strip():
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id, 
+                        text=parts[-1], 
+                        reply_markup=reply_markup, 
+                        parse_mode=ParseMode.HTML, 
+                        disable_web_page_preview=True
+                    )
+
     except Exception as e:
+        # Этот блок ловит ошибки, возникшие внутри самого бота, а не в бэкенде
         logger.error(f"Критическая ошибка в handle_creative для user {user.id}: {e}", exc_info=True)
         user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В handle_creative: {e}", exc_info=True)
-        await update.message.reply_text("Произошла внутренняя ошибка. Мы уже работаем над ее исправлением. Пожалуйста, попробуйте позже.")
+        await update.message.reply_text("Произошла внутренняя ошибка. Пожалуйста, попробуйте позже.")
         if ADMIN_USER_ID:
             await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id}!\nОшибка: {e}")
     finally:

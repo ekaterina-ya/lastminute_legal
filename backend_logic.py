@@ -11,7 +11,6 @@ import io
 import logging
 import json
 
-
 # --- Глобальные переменные для кеширования ---
 rag_df = None
 corpus_embeddings = None
@@ -134,43 +133,61 @@ def build_user_content(image: Image.Image = None, text: str = "") -> list:
 # ===============================================================
 
 SAFETY_SETTINGS = {
-    "HARM_CATEGORY_HARASSMENT": "BLOCK_ONLY_HIGH",
-    "HARM_CATEGORY_HATE_SPEECH": "BLOCK_ONLY_HIGH",
-    "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_ONLY_HIGH",
-    "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_ONLY_HIGH",
+    "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+    "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+    "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+    "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
 }
 
-def preprocess_content(user_content, user_logger: logging.Logger = None):
+def _parse_gemini_response(response, step_name: str, user_logger: logging.Logger):
+    """
+    Анализирует ответ от API Gemini, логирует его и возвращает статус и текст.
+    Статусы: 'SUCCESS', 'SAFETY', 'ERROR'.
+    """
+    if user_logger and hasattr(response, 'usage_metadata'):
+        user_logger.info(f"[API RESPONSE - {step_name}]\n{json.dumps(response.to_dict(), ensure_ascii=False, indent=2)}")
+
+    # 1. Сначала проверяем, есть ли вообще кандидаты. Если нет - это всегда техническая ошибка.
+    if not response.candidates:
+        reason = f"Причина: {response.prompt_feedback.block_reason}" if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason else "Причина не указана."
+        user_logger.error(f"Техническая ошибка на шаге '{step_name}': Пустой ответ от API (нет кандидатов). {reason}")
+        return 'ERROR', f"Пустой ответ от API. {reason}"
+
+    candidate = response.candidates[0]
+    finish_reason = candidate.finish_reason
+
+    # 2. Обработка успешного ответа (STOP)
+    if finish_reason.name == 'STOP':
+        # Правильный способ получить текст: объединить все части.
+        if hasattr(candidate.content, 'parts') and candidate.content.parts:
+            full_text = "".join(part.text for part in candidate.content.parts)
+            if full_text.strip():
+                return 'SUCCESS', full_text
+        
+        # Если дошли сюда, значит либо нет 'parts', либо 'full_text' пустой.
+        user_logger.warning(f"На шаге '{step_name}' получен finish_reason=STOP, но итоговый текст пустой.")
+        return 'ERROR', "Успешный статус от API, но пустой ответ."
+
+    # 3. Обработка блокировки по безопасности (SAFETY)
+    if finish_reason.name == 'SAFETY' or finish_reason.name =='PROHIBITED_CONTENT' or finish_reason.name =='BLOCKLIST':
+        safety_ratings_info = f"Safety Ratings: {candidate.safety_ratings}" if hasattr(candidate, 'safety_ratings') else ""
+        user_logger.warning(f"Запрос заблокирован по соображениям безопасности на шаге '{step_name}'. Finish Reason: SAFETY. {safety_ratings_info}")
+        return 'SAFETY', f"Контент заблокирован. Причина: SAFETY. {safety_ratings_info}"
+
+    # 4. Все остальные причины (MAX_TOKENS, RECITATION, OTHER и т.д.) считаем технической ошибкой.
+    error_message = f"Техническая ошибка API на шаге '{step_name}'. Finish Reason: {finish_reason.name}"
+    user_logger.error(error_message)
+    return 'ERROR', error_message
+
+def preprocess_content(user_content):
     """Шаг 1: Предварительная обработка (описание картинки, очистка текста)."""
     print("Шаг 1: Предварительная обработка контента...")
-    try:
-        content_for_api = [PROMPT_1_PREPROCESSING] + user_content
-        print("\n--- ДИАГНОСТИКА: СОДЕРЖИМОЕ ЗАПРОСА В GEMINI ---")
-        for i, part in enumerate(content_for_api):
-            print(f"  - Часть {i+1}: Тип = {type(part)}")
-            if isinstance(part, str):
-                print(f"    Содержимое (первые 100 символов): '{part[:100]}...'")
-            elif isinstance(part, Image.Image):
-                print(f"    Содержимое: Объект изображения, режим={part.mode}, размер={part.size}")
-            else:
-                print(f"    Содержимое: {part}")
-        print("--- КОНЕЦ ДИАГНОСТИКИ ---\n")
-
-        response = generative_model.generate_content(
-            content_for_api, 
-            safety_settings=SAFETY_SETTINGS
-        )
-        
-        if user_logger and hasattr(response, 'usage_metadata'):
-            user_logger.info(f"[API RESPONSE - Preprocessing]\n{json.dumps(response.to_dict(), ensure_ascii=False, indent=2)}")
-            
-        if not response.parts:
-             print("❗️ Запрос заблокирован системой безопасности Gemini.")
-             return {"error": "safety_block", "message": "Контент заблокирован системой безопасности."}
-        return response.text
-    except Exception as e:
-        print(f"❗️ Ошибка на этапе предварительной обработки: {e}")
-        return {"error": "processing_error", "message": str(e)}
+    content_for_api = [PROMPT_1_PREPROCESSING] + user_content
+    response = generative_model.generate_content(
+        content_for_api,
+        safety_settings=SAFETY_SETTINGS
+    )
+    return response
 
 def semantic_search(query_text: str, user_logger: logging.Logger = None):
     """Шаг 2: Семантический поиск релевантных кейсов."""
@@ -220,24 +237,13 @@ def format_rag_context(search_results_df):
         )
     return "\n---\n".join(context_parts)
 
-def get_final_analysis(processed_text, rag_context, user_logger: logging.Logger = None):
+def get_final_analysis(processed_text, rag_context):
     """Шаг 3: Генерация финального заключения."""
     print("Шаг 3: Генерация финального юридического заключения...")
-    try:
-        final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
-        final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
-            
-        response = generative_model.generate_content(final_prompt, safety_settings=SAFETY_SETTINGS)
-
-        if user_logger and hasattr(response, 'usage_metadata'):
-            user_logger.info(f"[API RESPONSE - Final Analysis]\n{json.dumps(response.to_dict(), ensure_ascii=False, indent=2)}")
-            
-        if not response.parts:
-            return "Ошибка: Финальный анализ был заблокирован системой безопасности. Если вы уверены, что бот ошибся, не допустив креатив к проверке, попробуйте отправить его повторно или перезапустите бота командой /start."
-        return response.text
-    except Exception as e:
-        print(f"❗️ Ошибка на этапе финального анализа: {e}")
-        return "Ошибка при формировании юридического заключения."
+    final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
+    final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
+    response = generative_model.generate_content(final_prompt, safety_settings=SAFETY_SETTINGS)
+    return response
 
 def postprocess_final_answer(final_text):
     """Шаг 4: Постобработка - добавление ссылок и дисклеймера."""
@@ -277,58 +283,64 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
     """
     Основной пайплайн анализа. Принимает данные от бота, возвращает словарь с результатом.
     """
-    if not any([file_bytes, text_content, file_path]):
-        return {"final_output": "Ошибка: не предоставлено данных для анализа.", "preprocessed_text": "N/A", "safety_violation": False}
+    try:
+        user_content_for_api = []
+        image_obj = None
 
-    user_content_for_api = []
-    image_obj = None
-
-    if file_path and file_path.lower().endswith('.pdf'):
-        print(f"Загрузка PDF файла: {original_filename}")
-        uploaded_file = genai.upload_file(path=file_path, display_name=original_filename)
-        user_content_for_api = build_user_content(text=text_content, image=uploaded_file)
-    else:
-        if file_bytes:
-            image_obj = resize_image(file_bytes)
-            if image_obj and user_id and user_logger:
-                try:
-                    file_count = get_and_increment_file_counter()
-                    new_filename = f"{user_id}_{file_count}.jpg"
-                    save_path = os.path.join(USER_FILES_DIR, new_filename)
-                    image_obj.save(save_path, 'JPEG', quality=85)
-                    user_logger.info(f"Обработанный файл сохранен по пути: {save_path}")
-                except Exception as e:
-                    print(f"❗️ Ошибка при сохранении файла для пользователя {user_id}: {e}")
-                    user_logger.error(f"Не удалось сохранить обработанный файл: {e}")
-        user_content_for_api = build_user_content(image=image_obj, text=text_content)
-    
-    # 1. Предварительная обработка
-    processed_text_result = preprocess_content(user_content_for_api, user_logger=user_logger)
-    
-    # Проверяем, вернулся ли словарь с ошибкой от preprocess_content
-    if isinstance(processed_text_result, dict):
-        if processed_text_result.get('error') == 'safety_block':
-            return {"final_output": None, "preprocessed_text": processed_text_result['message'], "safety_violation": True}
+        if file_path and file_path.lower().endswith('.pdf'):
+            print(f"Загрузка PDF файла: {original_filename}")
+            uploaded_file = genai.upload_file(path=file_path, display_name=original_filename)
+            user_content_for_api = build_user_content(text=text_content, image=uploaded_file)
         else:
-            error_msg = processed_text_result.get('message', 'Неизвестная ошибка предобработки')
-            return {"final_output": error_msg, "preprocessed_text": error_msg, "safety_violation": False}
+            if file_bytes:
+                image_obj = resize_image(file_bytes)
+                if image_obj and user_id and user_logger:
+                    try:
+                        file_count = get_and_increment_file_counter()
+                        new_filename = f"{user_id}_{file_count}.jpg"
+                        save_path = os.path.join(USER_FILES_DIR, new_filename)
+                        image_obj.save(save_path, 'JPEG', quality=85)
+                        user_logger.info(f"Обработанный файл сохранен по пути: {save_path}")
+                    except Exception as e:
+                        user_logger.error(f"Не удалось сохранить обработанный файл: {e}")
+            user_content_for_api = build_user_content(image=image_obj, text=text_content)
+        
+        # 1. Предварительная обработка
+        preprocess_response = preprocess_content(user_content_for_api)
+        status, result_text = _parse_gemini_response(preprocess_response, "Preprocessing", user_logger)
 
-    processed_text = processed_text_result
-    
-    # 2. Поиск в RAG
-    rag_results = semantic_search(processed_text, user_logger=user_logger)
-    rag_context = format_rag_context(rag_results)
-    
-    # 3. Финальный анализ
-    final_text = get_final_analysis(processed_text, rag_context, user_logger=user_logger)
-    if "Ошибка:" in final_text:
-        return {"final_output": final_text, "preprocessed_text": processed_text, "safety_violation": False}
-    
-    # 4. Пост-обработка
-    final_output = postprocess_final_answer(final_text)
-    
-    return {
-        "final_output": final_output,
-        "preprocessed_text": processed_text,
-        "safety_violation": False
-    }
+        if status == 'SAFETY':
+            return {"error_type": "safety", "message": result_text}
+        if status == 'ERROR':
+            raise Exception(f"Техническая ошибка на шаге предобработки: {result_text}")
+        
+        processed_text = result_text
+
+        # 2. Поиск в RAG
+        rag_results = semantic_search(processed_text, user_logger=user_logger)
+        rag_context = format_rag_context(rag_results)
+        
+        # 3. Финальный анализ
+        final_response = get_final_analysis(processed_text, rag_context)
+        status, final_text = _parse_gemini_response(final_response, "Final Analysis", user_logger)
+
+        if status == 'SAFETY':
+             return {"error_type": "safety", "message": final_text}
+        if status == 'ERROR':
+            raise Exception(f"Техническая ошибка на шаге финального анализа: {final_text}")
+        
+        # 4. Пост-обработка
+        final_output = postprocess_final_answer(final_text)
+        
+        return {
+            "final_output": final_output,
+            "preprocessed_text": processed_text
+        }
+        
+    except Exception as e:
+        # Этот блок теперь ловит все технические ошибки
+        print(f"❗️ Критическая ошибка в `analyze_creative_flow`: {e}")
+        if user_logger:
+            user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА в `analyze_creative_flow`: {e}", exc_info=True)
+        # Возвращаем словарь, который бот сможет обработать как техническую ошибку
+        return {"error_type": "technical", "message": str(e)}
