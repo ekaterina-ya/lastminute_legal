@@ -9,6 +9,8 @@ import re
 from PIL import Image
 import io
 import logging
+import json
+
 
 # --- Глобальные переменные для кеширования ---
 rag_df = None
@@ -160,7 +162,7 @@ def preprocess_content(user_content, user_logger: logging.Logger = None):
         )
         
         if user_logger and hasattr(response, 'usage_metadata'):
-            user_logger.info(f"[API METRICS - Preprocessing] {response.usage_metadata}")
+            user_logger.info(f"[API RESPONSE - Preprocessing]\n{json.dumps(response.to_dict(), ensure_ascii=False, indent=2)}")
             
         if not response.parts:
              print("❗️ Запрос заблокирован системой безопасности Gemini.")
@@ -224,14 +226,11 @@ def get_final_analysis(processed_text, rag_context, user_logger: logging.Logger 
     try:
         final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
         final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
-
-        if user_logger:
-            user_logger.info(f"[ПРОМПТ 2 (ФИНАЛЬНЫЙ)]\n{final_prompt}")
             
         response = generative_model.generate_content(final_prompt, safety_settings=SAFETY_SETTINGS)
 
         if user_logger and hasattr(response, 'usage_metadata'):
-            user_logger.info(f"[API METRICS - Final Analysis] {response.usage_metadata}")
+            user_logger.info(f"[API RESPONSE - Final Analysis]\n{json.dumps(response.to_dict(), ensure_ascii=False, indent=2)}")
             
         if not response.parts:
             return "Ошибка: Финальный анализ был заблокирован системой безопасности. Если вы уверены, что бот ошибся, не допустив креатив к проверке, попробуйте отправить его повторно или перезапустите бота командой /start."
