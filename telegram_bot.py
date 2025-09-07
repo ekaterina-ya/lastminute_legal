@@ -259,7 +259,7 @@ async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def learn_more(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     text_part1 = (
         """ <b>Спасибо за ваш интерес к нашему проекту!</b> 
-Этот бот проверяет рекламные креативы на соответствие ФЗ «О рекламе», опираясь на 700 + свежих (вынесенных за прошедшие 2,5 года) решений ФАС. Он работает по принципу Retrieval‑Augmented Generation (RAG): сначала ищет похожие кейсы, затем формирует ответ, обращаясь к нейросети Gemini 2.5 Pro.
+Этот бот проверяет рекламные креативы на соответствие ФЗ «О рекламе», опираясь на 700 + свежих (вынесенных за прошедшие 2,5 года) решений ФАС. Он работает по принципу Retrieval‑Augmented Generation (RAG): сначала ищет похожие кейсы, затем формирует ответ, обращаясь к нейросети Gemini 2.5 Pro (или Gemini 2.5 Flash, если Pro вдруг срабатывает с ошибками. Эта модель считается более слабой, так как не является «думающей», но и она, по нашей оценке, даёт неплохие заключения).
 
 <i>По каким критериям отбирались дела, как это было осуществлено технически, как структурирована база знаний, какие есть планы по ее дальнейшему развитию, и ДА КТО ТАКОЙ ЭТОТ ВАШ РАГ – об этом можно прочесть в <a href="https://t.me/delay_RAG">канале проекта</a>.</i> 
 
@@ -300,7 +300,7 @@ async def learn_more(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         4. файлы в интерфейсе Telegram можно загружать как файлы (но тогда не получится загрузить сделанное на iPhone фото — их стандартный формат HEIC) или как изображения (тогда фото с iPhone пройдет — Telegram сам их конвертирует в нужный формат);
         5. лимит знаков загружаемых текстов соответствует установленному Telegram лимиту для 1 сообщения. 
 
-В боте установлена защита от непристойного контента, нарушающего нормы морали и этики. 7 загрузки такого контента подряд или 15 загрузок в общей сложности влекут <b>блокировку</b> и невозможность использовать бот. Нейросеть может ошибаться на этапе фильтрации и быть слишком строга, мы рекомендуем попробовать загрузить тот же креатив еще раз позднее. Если бот сообщает о блокировке, но вы считаете, что контент ошибочно распознан как непристойный, вы можете связаться с автором проекта через <a href="https://t.me/delay_RAG">Telegram-канал</a>.
+В боте установлена защита от непристойного контента, нарушающего нормы морали и этики. 7 загрузок такого контента подряд или 15 загрузок в общей сложности влекут <b>блокировку</b> и невозможность использовать бот. Нейросеть может ошибаться на этапе фильтрации и быть слишком строга, мы рекомендуем попробовать загрузить тот же креатив еще раз позднее. В случае блокировки у вас всегда будет возможность связаться с автором канала, если вы считаете, что она необоснована.
 
 В целом приглашаем вас присоединиться к <a href="https://t.me/delay_RAG">каналу</a>! Он может быть интересен юристам, энтузиастам ИИ, и тем, кто интересуется low-code разработкой. Как оказалось, создание даже такого небольшого pet-проекта — весёлый и нюансированный процесс, о котором интересно рассказать. 
 Мы хотели создать доступный инструмент, который сделает деятельность рекламщиков, юристов и предпринимателей более эффективной, поэтому очень ценим обратную связь, конструктивную критику и предложения о сотрудничестве."""
@@ -399,17 +399,34 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if not file_bytes and not text_content and not temp_file_path:
             return
 
-        user_logger.info("Запуск анализа бэкендом...")
+       # --- ШАГ 1: Первая попытка с основной моделью ---
         analysis_result = await backend.analyze_creative_flow(
-            file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path, original_filename=file_name, user_id=user.id, user_logger=user_logger
+            file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path, 
+            original_filename=file_name, user_id=user.id, user_logger=user_logger, model_to_use='primary'
         )
         
         error_type = analysis_result.get("error_type")
 
-        if error_type == "safety":
-            # Нарушение безопасности: увеличиваем счетчик и проверяем, не пора ли блокировать
-            was_just_blocked = handle_safety_violation(user.id, user.username)
+        # --- ШАГ 2: Если техническая ошибка, пробуем fallback-модель ---
+        if error_type == "technical":
+            primary_error_message = analysis_result.get("message", "Неизвестная ошибка")
+            logger.error(f"Техническая ошибка (primary) для user {user.id}: {primary_error_message}")
+            if ADMIN_USER_ID:
+                await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде (primary) у пользователя {user.id}!\nОшибка: {primary_error_message}\n\nЗапускаю fallback-модель...")
 
+            await update.message.reply_text(
+                "Приносим извинения, нейросеть Gemini 2.5 Pro не сработала из-за проблем на стороне Google. Мы подготовим заключение с нейросетью Gemini 2.5 Flash. Gemini 2.5 Pro скорее всего скоро починят, можете попробовать еще раз позднее."
+            )
+            # Повторный вызов с fallback-моделью
+            analysis_result = await backend.analyze_creative_flow(
+                file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path, 
+                original_filename=file_name, user_id=user.id, user_logger=user_logger, model_to_use='fallback'
+            )
+            error_type = analysis_result.get("error_type") # Обновляем тип ошибки
+
+        # --- ШАГ 3: Финальная обработка результата (от первой или второй попытки) ---
+        if error_type == "safety":
+            was_just_blocked = handle_safety_violation(user.id, user.username)
             if was_just_blocked:
                 # Пользователь только что был заблокирован
                 block_text = "Ваш доступ к боту был заблокирован. Нейросеть может ошибаться в своей оценке загруженного вами контента. Если вы считаете, что произошла ошибка, свяжитесь с администратором."
@@ -430,11 +447,11 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await update.message.reply_text(warning_text, reply_markup=reply_markup)
 
         elif error_type == "technical":
-            # 4.1, 4.2, 4.4: Техническая ошибка
-            error_message = analysis_result.get("message", "Неизвестная ошибка")
-            logger.error(f"Техническая ошибка в backend для user {user.id}: {error_message}")
+            # Сюда мы попадаем, только если и fallback-модель не сработала
+            final_error_message = analysis_result.get("message", "Неизвестная ошибка")
+            logger.critical(f"ОБЕ МОДЕЛИ НЕ СРАБОТАЛИ для user {user.id}: {final_error_message}")
             if ADMIN_USER_ID:
-                await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде у пользователя {user.id}!\nОшибка: {error_message}")
+                await context.bot.send_message(ADMIN_USER_ID, f"КРИТИЧЕСКАЯ АВАРИЯ! Fallback-модель тоже не сработала у пользователя {user.id}!\nОшибка: {final_error_message}")
             
             keyboard = [
                 [InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="check_another")],
@@ -442,19 +459,21 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
-                "Приносим извинения, бот не выдает заключение из-за проблем на стороне Google. Обычно они решаются достаточно быстро. Попробуйте загрузить креатив позднее.",
+                "Приносим извинения, произошел серьезный сбой на стороне Google. Пожалуйста, попробуйте загрузить креатив позднее.",
                 reply_markup=reply_markup
             )
 
         else:
-            # 2: Успешное выполнение
+            # Успешное выполнение
             check_and_update_limit(user.id) # Списываем лимит только при успехе
             reset_consecutive_blocks(user.id)
             
-            user_logger.info(f"[ПРОМПТ 1 РЕЗУЛЬТАТ] {analysis_result.get('preprocessed_text', 'N/A')}")
-            final_output = analysis_result.get('final_output', "Произошла внутренняя ошибка. Пожалуйста, попробуйте позже.")
-            user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ] {final_output}")
+            model_used = analysis_result.get("model_used", "unknown")
+            if model_used == 'fallback' and ADMIN_USER_ID:
+                 await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} успешно подготовлено с помощью fallback-модели после сбоя основной.")
             
+            final_output = analysis_result.get('final_output', "Произошла внутренняя ошибка.")
+            user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ ({model_used})]: {final_output}")
             full_message = final_output
             
             keyboard = [

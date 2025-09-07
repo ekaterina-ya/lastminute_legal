@@ -16,7 +16,8 @@ rag_df = None
 corpus_embeddings = None
 doc_to_case_map = None
 embedding_model = None
-generative_model = None
+primary_generative_model = None
+fallback_generative_model = None
 PROMPT_1_PREPROCESSING = None
 PROMPT_2_ANALYSIS = None
 RAG_TOP_N = 5
@@ -69,16 +70,19 @@ def initialize_backend(logs_dir_path: str):
     PROMPT1_PATH = load_env_variable('PROMPT1_PREPROCESSING_PATH')
     PROMPT2_PATH = load_env_variable('PROMPT2_ANALYSIS_PATH')
     EMBEDDING_MODEL_NAME = load_env_variable('EMBEDDING_MODEL')
-    GENERATIVE_MODEL_NAME = load_env_variable('GENERATIVE_MODEL')
+    PRIMARY_GENERATIVE_MODEL_NAME = load_env_variable('PRIMARY_GENERATIVE_MODEL')
+    FALLBACK_GENERATIVE_MODEL_NAME = load_env_variable('FALLBACK_GENERATIVE_MODEL')
     RAG_TOP_N = load_env_variable('RAG_TOP_N', is_int=True, default=5)
 
     PROMPT_1_PREPROCESSING = load_prompt_from_file(PROMPT1_PATH)
     PROMPT_2_ANALYSIS = load_prompt_from_file(PROMPT2_PATH)
 
     # --- Конфигурация API и моделей ---
+    global primary_generative_model, fallback_generative_model
     genai.configure(api_key=API_KEY)
     embedding_model = genai.GenerativeModel(EMBEDDING_MODEL_NAME)
-    generative_model = genai.GenerativeModel(GENERATIVE_MODEL_NAME)
+    primary_generative_model = genai.GenerativeModel(PRIMARY_GENERATIVE_MODEL_NAME)
+    fallback_generative_model = genai.GenerativeModel(FALLBACK_GENERATIVE_MODEL_NAME)
     
     # --- Загрузка данных RAG ---
     print(f"Загрузка RAG данных из {RAG_DATA_PATH}")
@@ -179,11 +183,12 @@ def _parse_gemini_response(response, step_name: str, user_logger: logging.Logger
     user_logger.error(error_message)
     return 'ERROR', error_message
 
-def preprocess_content(user_content):
+def preprocess_content(user_content, model_instance):
     """Шаг 1: Предварительная обработка (описание картинки, очистка текста)."""
     print("Шаг 1: Предварительная обработка контента...")
     content_for_api = [PROMPT_1_PREPROCESSING] + user_content
-    response = generative_model.generate_content(
+    # Используем ПЕРЕДАННУЮ модель, а не глобальную
+    response = model_instance.generate_content(
         content_for_api,
         safety_settings=SAFETY_SETTINGS
     )
@@ -237,12 +242,12 @@ def format_rag_context(search_results_df):
         )
     return "\n---\n".join(context_parts)
 
-def get_final_analysis(processed_text, rag_context):
+def get_final_analysis(processed_text, rag_context, model_instance):
     """Шаг 3: Генерация финального заключения."""
     print("Шаг 3: Генерация финального юридического заключения...")
     final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
     final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
-    response = generative_model.generate_content(final_prompt, safety_settings=SAFETY_SETTINGS)
+    response = model_instance.generate_content(final_prompt, safety_settings=SAFETY_SETTINGS)
     return response
 
 def postprocess_final_answer(final_text):
@@ -298,11 +303,21 @@ def postprocess_final_answer(final_text):
 # ===============================================================
 # БЛОК 4: ГЛАВНАЯ ФУНКЦИЯ (ТОЧКА ВХОДА ДЛЯ БОТА)
 # ===============================================================
-async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None, original_filename=None, user_id: int = None, user_logger: logging.Logger = None) -> dict:
+async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None, original_filename=None, user_id: int = None, user_logger: logging.Logger = None, model_to_use: str = 'primary') -> dict:
     """
     Основной пайплайн анализа. Принимает данные от бота, возвращает словарь с результатом.
     """
     try:
+        # Выбираем, какую модель использовать, на основе параметра model_to_use
+        if model_to_use == 'fallback':
+            selected_model = fallback_generative_model
+            model_name_for_log = "Fallback (Flash)"
+        else:
+            selected_model = primary_generative_model
+            model_name_for_log = "Primary (Pro)"
+            
+        user_logger.info(f"--- Начало анализа с использованием модели: {model_name_for_log} ---")
+
         user_content_for_api = []
         image_obj = None
 
@@ -324,14 +339,14 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
                         user_logger.error(f"Не удалось сохранить обработанный файл: {e}")
             user_content_for_api = build_user_content(image=image_obj, text=text_content)
         
-        # 1. Предварительная обработка
-        preprocess_response = preprocess_content(user_content_for_api)
-        status, result_text = _parse_gemini_response(preprocess_response, "Preprocessing", user_logger)
+        # 1. Предварительная обработка с выбранной моделью
+        preprocess_response = preprocess_content(user_content_for_api, selected_model)
+        status, result_text = _parse_gemini_response(preprocess_response, f"Preprocessing ({model_name_for_log})", user_logger)
 
         if status == 'SAFETY':
-            return {"error_type": "safety", "message": result_text}
+            return {"error_type": "safety", "message": result_text, "model_used": model_to_use}
         if status == 'ERROR':
-            raise Exception(f"Техническая ошибка на шаге предобработки: {result_text}")
+            raise Exception(f"Техническая ошибка на шаге предобработки ({model_name_for_log}): {result_text}")
         
         processed_text = result_text
 
@@ -339,27 +354,28 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         rag_results = semantic_search(processed_text, user_logger=user_logger)
         rag_context = format_rag_context(rag_results)
         
-        # 3. Финальный анализ
-        final_response = get_final_analysis(processed_text, rag_context)
-        status, final_text = _parse_gemini_response(final_response, "Final Analysis", user_logger)
+        # 3. Финальный анализ с выбранной моделью
+        final_response = get_final_analysis(processed_text, rag_context, selected_model)
+        status, final_text = _parse_gemini_response(final_response, f"Final Analysis ({model_name_for_log})", user_logger)
 
         if status == 'SAFETY':
-             return {"error_type": "safety", "message": final_text}
+             return {"error_type": "safety", "message": final_text, "model_used": model_to_use}
         if status == 'ERROR':
-            raise Exception(f"Техническая ошибка на шаге финального анализа: {final_text}")
+            raise Exception(f"Техническая ошибка на шаге финального анализа ({model_name_for_log}): {final_text}")
         
         # 4. Пост-обработка
         final_output = postprocess_final_answer(final_text)
         
         return {
             "final_output": final_output,
-            "preprocessed_text": processed_text
+            "preprocessed_text": processed_text,
+            "model_used": model_to_use
         }
         
     except Exception as e:
-        # Этот блок теперь ловит все технические ошибки
-        print(f"❗️ Критическая ошибка в `analyze_creative_flow`: {e}")
+        # Этот блок ловит все технические ошибки
+        print(f"❗️ Критическая ошибка в `analyze_creative_flow` с моделью {model_to_use}: {e}")
         if user_logger:
-            user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА в `analyze_creative_flow`: {e}", exc_info=True)
+            user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА в `analyze_creative_flow` с моделью {model_to_use}: {e}", exc_info=True)
         # Возвращаем словарь, который бот сможет обработать как техническую ошибку
-        return {"error_type": "technical", "message": str(e)}
+        return {"error_type": "technical", "message": str(e), "model_used": model_to_use}
