@@ -230,7 +230,7 @@ def format_rag_context(search_results_df):
     context_parts = []
     for _, row in search_results_df.iterrows():
         context_parts.append(
-            f"Кейс (docId: \"{row['docID']}\"):\n"
+            f"Кейс (caseID: \"{row['caseID']}\"):\n"
             f"- Описание нарушения: \"{row.get('violation_summary', '')}\"\n"
             f"- Аргументы ФАС: \"{row.get('fas_arguments', '')}\"\n"
             f"- Теги: \"{row.get('thematic_tags', '')}\""
@@ -248,17 +248,36 @@ def get_final_analysis(processed_text, rag_context):
 def postprocess_final_answer(final_text):
     """Шаг 4: Постобработка - добавление ссылок и дисклеймера."""
     print("Шаг 4: Пост-обработка ответа...")
-    
-    def replace_link(match):
-        doc_id = match.group(1).strip()
-        case_id = doc_to_case_map.get(doc_id)
-        if case_id:
-            url = f"https://br.fas.gov.ru/cases/{case_id}/"
-            return f'<a href="{url}">[ссылка]</a>'
-        print(f"--- DEBUG: FAILED to find case_id for doc_id: {doc_id} ---")
-        return "в одном из дел (ID не найден)"
 
-    processed_text = re.sub(r"\[CASE_ID:\s*([^\]]+)\]", replace_link, final_text)
+    # Шаблон для UUID v4, который будет захвачен в группу для извлечения.
+    UUID_V4_PATTERN = r"([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})"
+
+    # Функция-заменитель. Она принимает объект совпадения от re.sub и возвращает отформатированную HTML-ссылку.
+    def replace_with_link(match):
+        # Извлекаем чистый UUID из первой (и единственной) захваченной группы.
+        case_id = match.group(1).strip().lower()
+        url = f"https://br.fas.gov.ru/cases/{case_id}/"
+        return f'<a href="{url}">[ссылка]</a>'
+
+    # Создаем единый и точный шаблон для поиска. Он ищет UUID, которому может (но не обязан) предшествовать "case ID" или "caseID". Вся найденная конструкция (ключевое слово + UUID) заменяется одной ссылкой.
+    pattern = re.compile(
+        # Начало необязательной, незахватываемой группы для ключевого слова.
+        # `?:` означает, что группа не будет сохранена в результатах.
+        # `?` в конце делает всю эту группу необязательной.
+        r"(?:" +
+        # Граница слова (`\b`), чтобы не найти "caseID" в середине другого слова.
+        r"\bcase\s?ID" +
+        # Опциональные разделители, такие как двоеточие или пробелы.
+        r"[:\s]*" +
+        # Конец необязательной группы.
+        r")?" +
+        # Основной шаблон UUID, результат которого мы захватываем в группу 1.
+        UUID_V4_PATTERN,
+        re.IGNORECASE  # Игнорировать регистр для "CaseID", "caseid" и т.д.
+    )
+
+    # Применяем замену ко всему тексту с помощью созданного шаблона.
+    processed_text = pattern.sub(replace_with_link, final_text)
     
     DISCLAIMER = """
 
