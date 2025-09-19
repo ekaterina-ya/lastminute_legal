@@ -88,7 +88,7 @@ def initialize_backend(logs_dir_path: str):
     print(f"Загрузка RAG данных из {RAG_DATA_PATH}")
     rag_df = pd.read_csv(RAG_DATA_PATH, sep=';')
     print(f"Загрузка эмбеддингов из {CORPUS_EMBEDDINGS_PATH}")
-    corpus_embeddings = np.load(CORPUS_EMBEDDINGS_PATH, allow_pickle = True )
+    corpus_embeddings = np.load(CORPUS_EMBEDDINGS_PATH)
     
     if 'docID' not in rag_df.columns or 'caseID' not in rag_df.columns:
         raise ValueError("В RAG файле отсутствуют колонки 'docID' и/или 'caseID'.")
