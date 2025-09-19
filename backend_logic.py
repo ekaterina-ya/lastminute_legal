@@ -86,7 +86,7 @@ def initialize_backend(logs_dir_path: str):
     
     # --- Загрузка данных RAG ---
     print(f"Загрузка RAG данных из {RAG_DATA_PATH}")
-    rag_df = pd.read_csv(RAG_DATA_PATH)
+    rag_df = pd.read_csv(RAG_DATA_PATH, sep=';')
     print(f"Загрузка эмбеддингов из {CORPUS_EMBEDDINGS_PATH}")
     corpus_embeddings = np.load(CORPUS_EMBEDDINGS_PATH)
     
