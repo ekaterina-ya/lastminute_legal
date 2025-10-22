@@ -6,7 +6,7 @@ import logging
 import sqlite3
 import pytz
 import asyncio
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
@@ -14,6 +14,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 import backend_logic as backend
+import aggregator
 
 # --- Настройка логирования ---
 LOGS_DIR = os.getenv('LOGS_DIR', 'user_logs')
@@ -525,7 +526,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Этот блок ловит ошибки, возникшие внутри самого бота, а не в бэкенде
         logger.error(f"Критическая ошибка в handle_creative для user {user.id}: {e}", exc_info=True)
         user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В handle_creative: {e}", exc_info=True)
-        await update.message.reply_text("Произошла внутренняя ошибка. Пожалуйста, попробуйте позже.")
+        await update.message.reply_text("Приносим извинения, произошла внутренняя ошибка. Пожалуйста, попробуйте позже: для перезапуска бота введите команду /start")
         if ADMIN_USER_ID:
             await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id}!\nОшибка: {e}")
     finally:
@@ -554,9 +555,46 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Ошибка: ID пользователя должен быть числом.")
     except Exception as e:
         await update.message.reply_text(f"Произошла ошибка при разблокировке: {e}")
-        
+
 # ===============================================================
-# БЛОК 4: ЛОГИКА ОБРАТНОЙ СВЯЗИ (CONVERSATION HANDLER)
+# БЛОК 4: ПЛАНИРОВЩИК
+# ===============================================================
+async def run_daily_scheduler():
+    """Асинхронный планировщик, который запускает агрегатор раз в сутки."""
+    MOSCOW_TZ = pytz.timezone('Europe/Moscow')
+    SCHEDULE_TIME = time(20, 00) # 20:00 по Москве
+
+    print("Планировщик отчетов запущен.")
+    while True:
+        try:
+            now_moscow = datetime.now(MOSCOW_TZ)
+            
+            # Определяем следующую дату запуска
+            target_datetime = now_moscow.replace(hour=SCHEDULE_TIME.hour, minute=SCHEDULE_TIME.minute, second=0, microsecond=0)
+            if now_moscow > target_datetime:
+                # Если 20:00 сегодня уже прошло, планируем на завтра
+                target_datetime += timedelta(days=1)
+            
+            sleep_seconds = (target_datetime - now_moscow).total_seconds()
+            
+            print(f"Следующий запуск агрегатора запланирован на {target_datetime.strftime('%Y-%m-%d %H:%M:%S')}. Сон на {int(sleep_seconds)} секунд.")
+            await asyncio.sleep(sleep_seconds)
+
+            # Время пришло! Запускаем агрегатор.
+            print("Время пришло! Запускаю агрегацию логов...")
+            aggregator.run_aggregation_logic()
+            print("Агрегация логов завершена.")
+            
+            # Небольшая пауза, чтобы избежать повторного запуска в ту же секунду
+            await asyncio.sleep(60)
+
+        except Exception as e:
+            print(f"Критическая ошибка в планировщике: {e}")
+            # Ждем 5 минут перед повторной попыткой, чтобы не спамить лог ошибками
+            await asyncio.sleep(300)
+
+# ===============================================================
+# БЛОК 5: ЛОГИКА ОБРАТНОЙ СВЯЗИ (CONVERSATION HANDLER)
 # ===============================================================
 async def give_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
@@ -702,7 +740,7 @@ async def handle_unexpected_text_in_feedback(update: Update, context: ContextTyp
         "Если вы хотите прервать опрос и вернуться в главное меню, отправьте команду /start."
     )
 # ===============================================================
-# БЛОК 5: ЗАПУСК БОТА
+# БЛОК 6: ЗАПУСК БОТА
 # ===============================================================
 
 def main() -> None:
@@ -748,6 +786,9 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(button_handler))
 
     loop = asyncio.get_event_loop()
+    # Запускаем  планировщик как фоновую задачу
+    loop.create_task(run_daily_scheduler())
+    
     if ADMIN_USER_ID:
         loop.run_until_complete(application.bot.send_message(ADMIN_USER_ID, "Бот успешно запущен/перезапущен!"))
 

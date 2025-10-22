@@ -306,37 +306,30 @@ def send_telegram_message(token, chat_id, text):
 # БЛОК 5: ТОЧКА ВХОДА
 # ===============================================================
 
-def main():
-    """Главная функция-оркестратор."""
-    
+def run_aggregation_logic():
+    """Главная функция-оркестратор, которую можно импортировать."""
+
     output_dir = os.path.dirname(OUTPUT_CSV_PATH)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
         print(f"Создана директория для аналитики: {output_dir}")
 
-    # 1. Парсим все логи и получаем DataFrame
     main_df = process_all_logs(LOGS_DIRECTORY)
-    
+
     if main_df.empty:
         print("Не найдено данных для обработки. Отправка отчета и сохранение CSV пропущены.")
-        # Можно отправить сообщение, что данных нет
         if TELEGRAM_BOT_TOKEN and ADMIN_USER_ID:
             send_telegram_message(TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, f"Отчет за {datetime.now().date().strftime('%d.%m.%Y')}:\n\nНовых запросов за сегодня не было.")
         return
 
-    # 2. Сохраняем агрегированные данные в CSV
     try:
         main_df.to_csv(OUTPUT_CSV_PATH, index=False, encoding='utf-8-sig')
         print(f"Данные успешно сохранены в файл: {OUTPUT_CSV_PATH}")
     except Exception as e:
         print(f"Ошибка при сохранении CSV файла: {e}")
 
-    # 3. Генерируем и отправляем отчет
     if TELEGRAM_BOT_TOKEN and ADMIN_USER_ID:
         report_text = generate_summary_report(main_df, DB_PATH)
         send_telegram_message(TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, report_text)
     else:
         print("Токен бота или ID администратора не указаны. Отправка отчета пропущена.")
-
-if __name__ == '__main__':
-    main()
