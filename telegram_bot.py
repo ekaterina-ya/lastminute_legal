@@ -437,7 +437,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             primary_error_message = analysis_result.get("message", "Неизвестная ошибка")
             logger.error(f"Техническая ошибка (primary) для user {user.id}: {primary_error_message}")
             if ADMIN_USER_ID:
-                await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде (primary) у пользователя {user.id}!\nОшибка: {primary_error_message}\n\nЗапускаю fallback-модель...")
+                await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде (primary) у пользователя {user.id} (@{user.username})!\nОшибка: {primary_error_message}\n\nЗапускаю fallback-модель...")
 
             await update.message.reply_text(
                 "Приносим извинения, нейросеть Gemini 2.5 Pro не сработала из-за проблем на стороне Google. Мы подготовим заключение с нейросетью Gemini 2.5 Flash. Gemini 2.5 Pro скорее всего скоро починят, можете попробовать еще раз позднее."
@@ -476,7 +476,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             final_error_message = analysis_result.get("message", "Неизвестная ошибка")
             logger.critical(f"ОБЕ МОДЕЛИ НЕ СРАБОТАЛИ для user {user.id}: {final_error_message}")
             if ADMIN_USER_ID:
-                await context.bot.send_message(ADMIN_USER_ID, f"КРИТИЧЕСКАЯ АВАРИЯ! Fallback-модель тоже не сработала у пользователя {user.id}!\nОшибка: {final_error_message}")
+                await context.bot.send_message(ADMIN_USER_ID, f"КРИТИЧЕСКАЯ АВАРИЯ! Fallback-модель тоже не сработала у пользователя {user.id} (@{user.username})!\nОшибка: {final_error_message}")
             
             keyboard = [
                 [InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="check_another")],
@@ -495,7 +495,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
             model_used = analysis_result.get("model_used", "unknown")
             if model_used == 'fallback' and ADMIN_USER_ID:
-                 await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} успешно подготовлено с помощью fallback-модели после сбоя основной.")
+                 await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} (@{user.username}) успешно подготовлено с помощью fallback-модели после сбоя основной.")
             
             final_output = analysis_result.get('final_output', "Произошла внутренняя ошибка.")
             user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ ({model_used})]: {final_output}")
@@ -552,7 +552,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В handle_creative: {e}", exc_info=True)
         await update.message.reply_text("Приносим извинения, произошла внутренняя ошибка. Пожалуйста, попробуйте позже: для перезапуска бота введите команду /start")
         if ADMIN_USER_ID:
-            await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id}!\nОшибка: {e}")
+            await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id} (@{user.username})!\nОшибка: {e}")
     finally:
         context.user_data['is_processing'] = False
 
