@@ -5,23 +5,46 @@ import os
 import re
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import sqlite3
 from datetime import datetime, timedelta
 import json
+import logging #
 
 # ===============================================================
 # БЛОК 1: КОНФИГУРАЦИЯ (значения подтянутся из переменных окружения на Render)
 # ===============================================================
 # Абсолютный путь к директории с логами на сервере Render
-LOGS_DIRECTORY = os.getenv('LOGS_DIR', '/var/render-data/user_logs') 
+LOGS_DIRECTORY = os.getenv('LOGS_DIR') 
 # Абсолютный путь к базе данных SQLite на сервере
-DB_PATH = os.getenv('DATABASE_PATH', '/var/render-data/data/user_data.db')
+DB_PATH = os.getenv('DATABASE_PATH')
 # Путь для сохранения итогового CSV-файла
-OUTPUT_CSV_PATH = os.getenv('OUTPUT_CSV_PATH', '/var/render-data/analytics/aggregated_log_data.csv')
+OUTPUT_CSV_PATH = os.getenv('OUTPUT_CSV_PATH')
+# --- Путь к лог-файлу самого агрегатора ---
+AGGREGATOR_LOG_PATH = os.getenv('AGGREGATOR_LOG_PATH') # 
 
 # --- Настройки Telegram ---
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') # Ваш токен бота
 ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')          # Ваш числовой ID администратора
+
+# --- Настройка логирования --- #
+# Убедимся, что директория для лога существует
+os.makedirs(os.path.dirname(AGGREGATOR_LOG_PATH), exist_ok=True)
+
+# Создаем логгер
+logger = logging.getLogger('aggregator_logger')
+logger.setLevel(logging.INFO)
+
+# Создаем обработчик, который будет записывать логи в файл
+file_handler = logging.FileHandler(AGGREGATOR_LOG_PATH, encoding='utf-8')
+
+# Создаем форматтер и добавляем его в обработчик
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+
+# Добавляем обработчик в логгер
+logger.addHandler(file_handler)
 
 # ===============================================================
 # БЛОК 2: ФУНКЦИИ ПАРСИНГА ОДНОГО ЗАПРОСА
@@ -148,9 +171,9 @@ def process_all_logs(log_dir):
     """Обрабатывает все log-файлы в директории и возвращает единый DataFrame."""
     all_requests_data = []
     
-    print(f"Начинаю обработку логов из директории: {log_dir}")
+    logger.info(f"Начинаю обработку логов из директории: {log_dir}")
     if not os.path.isdir(log_dir):
-        print(f"Ошибка: Директория {log_dir} не найдена.")
+        logger.error(f"Директория {log_dir} не найдена.")
         return pd.DataFrame()
 
     for filename in os.listdir(log_dir):
@@ -162,7 +185,7 @@ def process_all_logs(log_dir):
                 with open(filepath, 'r', encoding='utf-8') as f:
                     content = f.read()
             except Exception as e:
-                print(f"Не удалось прочитать файл {filename}: {e}")
+                logger.error(f"Не удалось прочитать файл {filename}: {e}")
                 continue
             
             # Разделяем весь лог на блоки по каждому новому запросу
@@ -179,7 +202,7 @@ def process_all_logs(log_dir):
                 parsed_data = parse_request_block(block, user_id, username)
                 all_requests_data.append(parsed_data)
 
-    print(f"Обработка логов завершена. Найдено {len(all_requests_data)} записей.")
+    logger.info(f"Обработка логов завершена. Найдено {len(all_requests_data)} записей.")
     if not all_requests_data:
         return pd.DataFrame()
         
@@ -221,7 +244,7 @@ def generate_summary_report(df, db_path):
             users_before_today_set = set(df[df['request_date'].dt.date < today]['telegram_id'].unique())
             new_users_today = len(users_today_set - users_before_today_set)
     except Exception as e:
-        print(f"Не удалось посчитать новых пользователей: {e}")
+        logger.error(f"Не удалось посчитать новых пользователей: {e}")
     
     # 3. Всего пользователей (из БД)
     total_users_all_time = 0
@@ -231,7 +254,7 @@ def generate_summary_report(df, db_path):
             cursor.execute("SELECT COUNT(user_id) FROM users")
             total_users_all_time = cursor.fetchone()[0]
     except Exception as e:
-        print(f"Не удалось получить данные из БД: {e}")
+        logger.error(f"Не удалось получить данные из БД: {e}")
 
     # 4. Запросов сегодня
     daily_requests = len(df_today)
@@ -295,12 +318,24 @@ def send_telegram_message(token, chat_id, text):
         'text': text,
         'parse_mode': 'Markdown'
     }
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=3,  # Общее количество повторных попыток
+        status_forcelist=[429, 500, 502, 503, 504],  # Коды состояния HTTP, при которых нужно повторить
+        allowed_methods=["POST"],  # Методы, для которых будет работать повтор
+        backoff_factor=1  # Задержка между попытками (1с, 2с, 4с)
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    # -----------------------------
+
     try:
-        response = requests.post(url, json=payload, timeout=10)
+        # Используем созданную сессию вместо прямого вызова requests.post
+        response = session.post(url, json=payload, timeout=20) # Увеличим таймаут до 20 секунд
         response.raise_for_status()
-        print("Отчет успешно отправлен в Telegram.")
+        logger.info("Отчет успешно отправлен в Telegram.")
     except requests.exceptions.RequestException as e:
-        print(f"Не удалось отправить отчет в Telegram: {e}")
+        logger.error(f"Не удалось отправить отчет в Telegram после нескольких попыток: {e}")
 
 # ===============================================================
 # БЛОК 5: ТОЧКА ВХОДА
@@ -308,28 +343,29 @@ def send_telegram_message(token, chat_id, text):
 
 def run_aggregation_logic():
     """Главная функция-оркестратор, которую можно импортировать."""
-
+    logger.info("--- Запуск задачи агрегации ---")
     output_dir = os.path.dirname(OUTPUT_CSV_PATH)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-        print(f"Создана директория для аналитики: {output_dir}")
+        logger.info(f"Создана директория для аналитики: {output_dir}")
 
     main_df = process_all_logs(LOGS_DIRECTORY)
 
     if main_df.empty:
-        print("Не найдено данных для обработки. Отправка отчета и сохранение CSV пропущены.")
+        logger.warning("Не найдено данных для обработки. Отправка отчета и сохранение CSV пропущены.")
         if TELEGRAM_BOT_TOKEN and ADMIN_USER_ID:
             send_telegram_message(TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, f"Отчет за {datetime.now().date().strftime('%d.%m.%Y')}:\n\nНовых запросов за сегодня не было.")
         return
 
     try:
         main_df.to_csv(OUTPUT_CSV_PATH, index=False, encoding='utf-8-sig')
-        print(f"Данные успешно сохранены в файл: {OUTPUT_CSV_PATH}")
+        logger.info(f"Данные успешно сохранены в файл: {OUTPUT_CSV_PATH}")
     except Exception as e:
-        print(f"Ошибка при сохранении CSV файла: {e}")
+        logger.error(f"Ошибка при сохранении CSV файла: {e}")
 
     if TELEGRAM_BOT_TOKEN and ADMIN_USER_ID:
         report_text = generate_summary_report(main_df, DB_PATH)
         send_telegram_message(TELEGRAM_BOT_TOKEN, ADMIN_USER_ID, report_text)
     else:
-        print("Токен бота или ID администратора не указаны. Отправка отчета пропущена.")
+        logger.warning("Токен бота или ID администратора не указаны. Отправка отчета пропущена.")
+    logger.info("--- Задача агрегации завершена ---")
