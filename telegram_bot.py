@@ -62,6 +62,8 @@ MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 CONSECUTIVE_BLOCK_LIMIT = 7
 TOTAL_BLOCK_LIMIT = 15
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+MAX_FILE_SIZE_MB = 20
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 
 # --- Состояния для ConversationHandler (опрос обратной связи) ---
 (RATING, USAGE, PROFILE, ELABORATE, FEEDBACK_TEXT) = range(5)
@@ -249,7 +251,7 @@ async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 Отлично! Остаток проверок на сегодня: <b>{remaining}</b>.
         
 Отправьте мне:
-        • Изображение в формате .jpg или .png или PDF-файл объёмом до 5 страниц. Максимальный размер файла — <b>до 10 МБ</b>.
+        • Изображение в формате .jpg или .png или PDF-файл объёмом до 5 страниц. Максимальный размер файла — <b>до 20 МБ</b>.
         • Текст вашего креатива (например, слоган или текст рассылки), вставив его в строку ввода. Не добавляйте комментариев или инструкций (например, «проверь этот слоган») – <b>только сам текст</b>.
         
 Вы можете отправить как что-то одно (только файл или только текст), так и файл с текстом. Пожалуйста, не загружайте контент, нарушающий нормы этики и морали – нейросеть не допустит его к проверке, а ваш доступ к боту будет заблокирован. 
@@ -296,7 +298,7 @@ async def learn_more(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 И напоследок немного о <b>пользовательских ограничениях</b>. На данный момент действуют следующие лимиты:
         1. 10 запросов в день (в 24 часа) — счетчик обнуляется в 00:00 по Москве;
-        2. размер загружаемого файла — 10 мб;
+        2. размер загружаемого файла — 20 МБ;
         3. форматы загружаемых файлов — JPG, PNG, PDF. В PDF-файле должно быть не более 5 страниц; 
         4. файлы в интерфейсе Telegram можно загружать как файлы (но тогда не получится загрузить сделанное на iPhone фото — их стандартный формат HEIC) или как изображения (тогда фото с iPhone пройдет — Telegram сам их конвертирует в нужный формат);
         5. лимит знаков загружаемых текстов соответствует установленному Telegram лимиту для 1 сообщения. 
@@ -362,6 +364,11 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     context.user_data['is_processing'] = True
     context.user_data['awaiting_creative'] = False
+
+    error_text = f"Проверьте ваш файл: поддерживаются только файлы формата .jpg, .png и .pdf. не более {MAX_FILE_SIZE_MB} МБ."
+    error_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Попробовать еще раз", callback_data="check_another")]
+    ])
     
     temp_file_path = None
     try:
@@ -378,28 +385,45 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         if update.message.photo:
             photo = update.message.photo[-1]
+            # 2. Проверяем размер фото
+            if photo.file_size > MAX_FILE_SIZE_BYTES:
+                await update.message.reply_text(error_text, reply_markup=error_keyboard)
+                # Сбрасываем флаг обработки, чтобы пользователь мог сразу отправить новый файл
+                context.user_data['is_processing'] = False
+                return
+
             file_id = photo.file_id
             file_name = f"{user.id}_{datetime.now().timestamp()}.jpg"
             new_file = await context.bot.get_file(file_id)
             file_bytes = bytes(await new_file.download_as_bytearray())
+            
         elif update.message.document:
             doc = update.message.document
-            if doc.mime_type in ['application/pdf', 'image/jpeg', 'image/png']:
-                file_id = doc.file_id
-                file_name = doc.file_name
-                new_file = await context.bot.get_file(file_id)
-                if doc.mime_type == 'application/pdf':
-                    temp_file_path = os.path.join(LOGS_DIR, file_name)
-                    await new_file.download_to_drive(temp_file_path)
-                else:
-                    file_bytes = bytes(await new_file.download_as_bytearray())
-            else:
-                await update.message.reply_text("Ошибка: поддерживаются только файлы .jpg, .png и .pdf.")
-                return
-        
-        if not file_bytes and not text_content and not temp_file_path:
-            return
 
+            # 3. Единая проверка формата и размера для документа
+            if doc.file_size > MAX_FILE_SIZE_BYTES or doc.mime_type not in ['application/pdf', 'image/jpeg', 'image/png']:
+                await update.message.reply_text(error_text, reply_markup=error_keyboard)
+                # Сбрасываем флаг обработки
+                context.user_data['is_processing'] = False
+                return
+
+            # Если проверки пройдены, продолжаем как обычно
+            file_id = doc.file_id
+            file_name = doc.file_name
+            new_file = await context.bot.get_file(file_id)
+            if doc.mime_type == 'application/pdf':
+                temp_file_path = os.path.join(LOGS_DIR, file_name)
+                await new_file.download_to_drive(temp_file_path)
+            else:
+                file_bytes = bytes(await new_file.download_as_bytearray())
+        
+        # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+
+        if not file_bytes and not text_content and not temp_file_path:
+            # Важно сбросить флаг, если пользователь отправил пустое сообщение
+            context.user_data['is_processing'] = False
+            return
+            
        # --- ШАГ 1: Первая попытка с основной моделью ---
         analysis_result = await backend.analyze_creative_flow(
             file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path, 
