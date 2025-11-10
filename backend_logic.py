@@ -20,7 +20,7 @@ primary_generative_model = None
 fallback_generative_model = None
 PROMPT_1_PREPROCESSING = None
 PROMPT_2_ANALYSIS = None
-RAG_TOP_N = 5
+RAG_TOP_N = 10
 USER_FILES_DIR = None
 FILE_COUNTER_PATH = None
 
