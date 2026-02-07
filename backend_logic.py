@@ -15,12 +15,10 @@ import json
 rag_df = None
 corpus_embeddings = None
 doc_to_case_map = None
-embedding_model = None
-primary_generative_model = None
-fallback_generative_model = None
+gemini_client = None  # Единый клиент для работы с Gemini API
 PROMPT_1_PREPROCESSING = None
 PROMPT_2_ANALYSIS = None
-RAG_TOP_N = 5
+RAG_TOP_N = 10
 USER_FILES_DIR = None
 FILE_COUNTER_PATH = None
 
@@ -39,12 +37,128 @@ def load_prompt_from_file(file_path):
     except FileNotFoundError:
         raise ValueError(f"КРИТИЧЕСКАЯ ОШИБКА: Файл с промптом не найден по пути '{file_path}'.")
 
+
+# ===============================================================
+# БЛОК 2: GEMINI CLIENT (обёртка над API)
+# ===============================================================
+
+class GeminiClient:
+    """
+    Обёртка над google.generativeai для работы с Gemini.
+    При смене модели (на другую LLM) — менять только этот класс.
+    """
+    
+    SAFETY_SETTINGS = {
+        "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+        "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+        "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+        "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
+    }
+    
+    def __init__(self, api_key: str, primary_model: str, fallback_model: str, embedding_model: str):
+        genai.configure(api_key=api_key)
+        self._primary_model = genai.GenerativeModel(primary_model)
+        self._fallback_model = genai.GenerativeModel(fallback_model)
+        self._embedding_model_name = embedding_model
+        self._primary_model_name = primary_model
+        self._fallback_model_name = fallback_model
+    
+    def generate(self, content: list, use_fallback: bool = False, user_logger: logging.Logger = None) -> dict:
+        """
+        Генерация ответа от LLM с парсингом.
+        Returns: dict: {status, text/message, model}
+        """
+        model = self._fallback_model if use_fallback else self._primary_model
+        model_name = self._fallback_model_name if use_fallback else self._primary_model_name
+        
+        try:
+            response = model.generate_content(
+                content,
+                safety_settings=self.SAFETY_SETTINGS
+            )
+            
+            status, result_text = self._parse_response(response, model_name, user_logger)
+            
+            if status == 'SUCCESS':
+                return {"status": "SUCCESS", "text": result_text, "model": model_name}
+            elif status == 'SAFETY':
+                return {"status": "SAFETY", "message": result_text, "model": model_name}
+            else:
+                return {"status": "ERROR", "message": result_text, "model": model_name}
+                
+        except Exception as e:
+            error_msg = f"Исключение при вызове API ({model_name}): {str(e)}"
+            if user_logger:
+                user_logger.error(error_msg)
+            return {"status": "ERROR", "message": error_msg, "model": model_name}
+    
+    def embed(self, text: str) -> np.ndarray:
+        """Создание эмбеддинга для текста."""
+        result = genai.embed_content(
+            model=self._embedding_model_name,
+            content=text,
+            task_type="RETRIEVAL_QUERY"
+        )
+        return np.array(result['embedding']).reshape(1, -1)
+    
+    def upload_file(self, file_path: str, display_name: str = None):
+        """Загрузка файла в Gemini Files API."""
+        return genai.upload_file(path=file_path, display_name=display_name)
+    
+    def _parse_response(self, response, model_name: str, user_logger: logging.Logger = None) -> tuple:
+        """
+        Парсинг ответа от API Gemini.
+        Returns: tuple (status, text/message)
+        """
+        if user_logger and hasattr(response, 'usage_metadata'):
+            user_logger.info(
+                f"[API RESPONSE - {model_name}]\n"
+                f"{json.dumps(response.to_dict(), ensure_ascii=False, indent=2)}"
+            )
+
+        if not response.candidates:
+            reason = ""
+            if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'):
+                reason = f"Причина: {response.prompt_feedback.block_reason}"
+            if user_logger:
+                user_logger.error(f"Пустой ответ от API (нет кандидатов). {reason}")
+            return 'ERROR', f"Пустой ответ от API. {reason}"
+
+        candidate = response.candidates[0]
+        finish_reason = candidate.finish_reason
+
+        if finish_reason.name == 'STOP':
+            if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                full_text = "".join(part.text for part in candidate.content.parts)
+                if full_text.strip():
+                    return 'SUCCESS', full_text
+            if user_logger:
+                user_logger.warning(f"finish_reason=STOP, но текст пустой")
+            return 'ERROR', "Успешный статус от API, но пустой ответ."
+
+        if finish_reason.name in ('SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST'):
+            safety_info = ""
+            if hasattr(candidate, 'safety_ratings'):
+                safety_info = f"Safety Ratings: {candidate.safety_ratings}"
+            if user_logger:
+                user_logger.warning(f"Запрос заблокирован по безопасности. {safety_info}")
+            return 'SAFETY', f"Контент заблокирован. Причина: {finish_reason.name}. {safety_info}"
+
+        if user_logger:
+            user_logger.error(f"Техническая ошибка API. Finish Reason: {finish_reason.name}")
+        return 'ERROR', f"Техническая ошибка API. Finish Reason: {finish_reason.name}"
+
+
+# ===============================================================
+# БЛОК 3: ИНИЦИАЛИЗАЦИЯ БЭКЭНДА
+# ===============================================================
+
 def initialize_backend(logs_dir_path: str):
     """
     Загружает все необходимые данные и модели в память при старте.
     Эта функция вызывается один раз при запуске бота.
     """
-    global rag_df, corpus_embeddings, doc_to_case_map, embedding_model, generative_model
+    global rag_df, corpus_embeddings, doc_to_case_map, gemini_client
     global PROMPT_1_PREPROCESSING, PROMPT_2_ANALYSIS, RAG_TOP_N
     global USER_FILES_DIR, FILE_COUNTER_PATH
 
@@ -77,12 +191,13 @@ def initialize_backend(logs_dir_path: str):
     PROMPT_1_PREPROCESSING = load_prompt_from_file(PROMPT1_PATH)
     PROMPT_2_ANALYSIS = load_prompt_from_file(PROMPT2_PATH)
 
-    # --- Конфигурация API и моделей ---
-    global primary_generative_model, fallback_generative_model
-    genai.configure(api_key=API_KEY)
-    embedding_model = genai.GenerativeModel(EMBEDDING_MODEL_NAME)
-    primary_generative_model = genai.GenerativeModel(PRIMARY_GENERATIVE_MODEL_NAME)
-    fallback_generative_model = genai.GenerativeModel(FALLBACK_GENERATIVE_MODEL_NAME)
+    # --- Создание GeminiClient ---
+    gemini_client = GeminiClient(
+        api_key=API_KEY,
+        primary_model=PRIMARY_GENERATIVE_MODEL_NAME,
+        fallback_model=FALLBACK_GENERATIVE_MODEL_NAME,
+        embedding_model=EMBEDDING_MODEL_NAME
+    )
     
     # --- Загрузка данных RAG ---
     print(f"Загрузка RAG данных из {RAG_DATA_PATH}")
@@ -95,8 +210,9 @@ def initialize_backend(logs_dir_path: str):
         
     doc_to_case_map = pd.Series(rag_df.caseID.values, index=rag_df.docID.astype(str)).to_dict()
 
+
 # ===============================================================
-# БЛОК 2: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# БЛОК 4: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ===============================================================
 
 def get_and_increment_file_counter() -> int:
@@ -132,78 +248,16 @@ def build_user_content(image: Image.Image = None, text: str = "") -> list:
         content_parts.append(image)
     return content_parts
 
+
 # ===============================================================
-# БЛОК 3: ОСНОВНЫЕ ФУНКЦИИ БЭКЭНДА (ШАГИ АНАЛИЗА)
+# БЛОК 5: ОСНОВНЫЕ ФУНКЦИИ БЭКЭНДА (ШАГИ АНАЛИЗА)
 # ===============================================================
-
-SAFETY_SETTINGS = {
-    "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-    "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-    "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-    "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-}
-
-def _parse_gemini_response(response, step_name: str, user_logger: logging.Logger):
-    """
-    Анализирует ответ от API Gemini, логирует его и возвращает статус и текст.
-    Статусы: 'SUCCESS', 'SAFETY', 'ERROR'.
-    """
-    if user_logger and hasattr(response, 'usage_metadata'):
-        user_logger.info(f"[API RESPONSE - {step_name}]\n{json.dumps(response.to_dict(), ensure_ascii=False, indent=2)}")
-
-    # 1. Сначала проверяем, есть ли вообще кандидаты. Если нет - это всегда техническая ошибка.
-    if not response.candidates:
-        reason = f"Причина: {response.prompt_feedback.block_reason}" if hasattr(response.prompt_feedback, 'block_reason') and response.prompt_feedback.block_reason else "Причина не указана."
-        user_logger.error(f"Техническая ошибка на шаге '{step_name}': Пустой ответ от API (нет кандидатов). {reason}")
-        return 'ERROR', f"Пустой ответ от API. {reason}"
-
-    candidate = response.candidates[0]
-    finish_reason = candidate.finish_reason
-
-    # 2. Обработка успешного ответа (STOP)
-    if finish_reason.name == 'STOP':
-        # Правильный способ получить текст: объединить все части.
-        if hasattr(candidate.content, 'parts') and candidate.content.parts:
-            full_text = "".join(part.text for part in candidate.content.parts)
-            if full_text.strip():
-                return 'SUCCESS', full_text
-        
-        # Если дошли сюда, значит либо нет 'parts', либо 'full_text' пустой.
-        user_logger.warning(f"На шаге '{step_name}' получен finish_reason=STOP, но итоговый текст пустой.")
-        return 'ERROR', "Успешный статус от API, но пустой ответ."
-
-    # 3. Обработка блокировки по безопасности (SAFETY)
-    if finish_reason.name == 'SAFETY' or finish_reason.name =='PROHIBITED_CONTENT' or finish_reason.name =='BLOCKLIST':
-        safety_ratings_info = f"Safety Ratings: {candidate.safety_ratings}" if hasattr(candidate, 'safety_ratings') else ""
-        user_logger.warning(f"Запрос заблокирован по соображениям безопасности на шаге '{step_name}'. Finish Reason: SAFETY. {safety_ratings_info}")
-        return 'SAFETY', f"Контент заблокирован. Причина: SAFETY. {safety_ratings_info}"
-
-    # 4. Все остальные причины (MAX_TOKENS, RECITATION, OTHER и т.д.) считаем технической ошибкой.
-    error_message = f"Техническая ошибка API на шаге '{step_name}'. Finish Reason: {finish_reason.name}"
-    user_logger.error(error_message)
-    return 'ERROR', error_message
-
-def preprocess_content(user_content, model_instance):
-    """Шаг 1: Предварительная обработка (описание картинки, очистка текста)."""
-    print("Шаг 1: Предварительная обработка контента...")
-    content_for_api = [PROMPT_1_PREPROCESSING] + user_content
-    # Используем ПЕРЕДАННУЮ модель, а не глобальную
-    response = model_instance.generate_content(
-        content_for_api,
-        safety_settings=SAFETY_SETTINGS
-    )
-    return response
 
 def semantic_search(query_text: str, user_logger: logging.Logger = None):
     """Шаг 2: Семантический поиск релевантных кейсов."""
     print(f"Шаг 2: Поиск {RAG_TOP_N} релевантных кейсов...")
     try:
-        result = genai.embed_content(
-            model=embedding_model.model_name,
-            content=query_text,
-            task_type="RETRIEVAL_QUERY"
-        )
-        query_embedding = np.array(result['embedding']).reshape(1, -1)
+        query_embedding = gemini_client.embed(query_text)
         similarities = np.dot(corpus_embeddings, query_embedding.T).flatten()
 
         top_10_indices_for_logging = np.argsort(similarities)[-10:][::-1]
@@ -241,14 +295,6 @@ def format_rag_context(search_results_df):
             f"- Теги: \"{row.get('thematic_tags', '')}\""
         )
     return "\n---\n".join(context_parts)
-
-def get_final_analysis(processed_text, rag_context, model_instance):
-    """Шаг 3: Генерация финального заключения."""
-    print("Шаг 3: Генерация финального юридического заключения...")
-    final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
-    final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
-    response = model_instance.generate_content(final_prompt, safety_settings=SAFETY_SETTINGS)
-    return response
 
 def postprocess_final_answer(final_text):
     """Шаг 4: Постобработка - добавление ссылок и дисклеймера."""
@@ -300,21 +346,18 @@ def postprocess_final_answer(final_text):
 """
     return processed_text + DISCLAIMER
 
+
 # ===============================================================
-# БЛОК 4: ГЛАВНАЯ ФУНКЦИЯ (ТОЧКА ВХОДА ДЛЯ БОТА)
+# БЛОК 6: ГЛАВНАЯ ФУНКЦИЯ (ТОЧКА ВХОДА ДЛЯ БОТА)
 # ===============================================================
 async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None, original_filename=None, user_id: int = None, user_logger: logging.Logger = None, model_to_use: str = 'primary') -> dict:
     """
     Основной пайплайн анализа. Принимает данные от бота, возвращает словарь с результатом.
     """
     try:
-        # Выбираем, какую модель использовать, на основе параметра model_to_use
-        if model_to_use == 'fallback':
-            selected_model = fallback_generative_model
-            model_name_for_log = "Fallback (Flash)"
-        else:
-            selected_model = primary_generative_model
-            model_name_for_log = "Primary (Pro)"
+        # Определяем, какую модель использовать
+        use_fallback = (model_to_use == 'fallback')
+        model_name_for_log = "Fallback (Flash)" if use_fallback else "Primary (Pro)"
             
         user_logger.info(f"--- Начало анализа с использованием модели: {model_name_for_log} ---")
 
@@ -323,7 +366,7 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
 
         if file_path and file_path.lower().endswith('.pdf'):
             print(f"Загрузка PDF файла: {original_filename}")
-            uploaded_file = genai.upload_file(path=file_path, display_name=original_filename)
+            uploaded_file = gemini_client.upload_file(file_path, display_name=original_filename)
             user_content_for_api = build_user_content(text=text_content, image=uploaded_file)
         else:
             if file_bytes:
@@ -339,29 +382,34 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
                         user_logger.error(f"Не удалось сохранить обработанный файл: {e}")
             user_content_for_api = build_user_content(image=image_obj, text=text_content)
         
-        # 1. Предварительная обработка с выбранной моделью
-        preprocess_response = preprocess_content(user_content_for_api, selected_model)
-        status, result_text = _parse_gemini_response(preprocess_response, f"Preprocessing ({model_name_for_log})", user_logger)
-
-        if status == 'SAFETY':
-            return {"error_type": "safety", "message": result_text, "model_used": model_to_use}
-        if status == 'ERROR':
-            raise Exception(f"Техническая ошибка на шаге предобработки ({model_name_for_log}): {result_text}")
+        # 1. Предварительная обработка контента через GeminiClient
+        print("Шаг 1: Предварительная обработка контента...")
+        content_for_preprocessing = [PROMPT_1_PREPROCESSING] + user_content_for_api
+        preprocess_result = gemini_client.generate(content_for_preprocessing, use_fallback=use_fallback, user_logger=user_logger)
         
-        processed_text = result_text
+        if preprocess_result["status"] == "SAFETY":
+            return {"error_type": "safety", "message": preprocess_result["message"], "model_used": model_to_use}
+        if preprocess_result["status"] == "ERROR":
+            raise Exception(f"Ошибка предобработки: {preprocess_result['message']}")
+        
+        processed_text = preprocess_result["text"]
 
         # 2. Поиск в RAG
         rag_results = semantic_search(processed_text, user_logger=user_logger)
         rag_context = format_rag_context(rag_results)
         
-        # 3. Финальный анализ с выбранной моделью
-        final_response = get_final_analysis(processed_text, rag_context, selected_model)
-        status, final_text = _parse_gemini_response(final_response, f"Final Analysis ({model_name_for_log})", user_logger)
-
-        if status == 'SAFETY':
-             return {"error_type": "safety", "message": final_text, "model_used": model_to_use}
-        if status == 'ERROR':
-            raise Exception(f"Техническая ошибка на шаге финального анализа ({model_name_for_log}): {final_text}")
+        # 3. Финальный анализ через GeminiClient
+        print("Шаг 3: Генерация финального юридического заключения...")
+        final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
+        final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
+        final_result = gemini_client.generate([final_prompt], use_fallback=use_fallback, user_logger=user_logger)
+        
+        if final_result["status"] == "SAFETY":
+            return {"error_type": "safety", "message": final_result["message"], "model_used": model_to_use}
+        if final_result["status"] == "ERROR":
+            raise Exception(f"Ошибка финального анализа: {final_result['message']}")
+        
+        final_text = final_result["text"]
         
         # 4. Пост-обработка
         final_output = postprocess_final_answer(final_text)
