@@ -117,10 +117,23 @@ class GeminiClient:
 
         if not response.candidates:
             reason = ""
+            is_safety_blocking = False
+
             if hasattr(response, 'prompt_feedback') and hasattr(response.prompt_feedback, 'block_reason'):
-                reason = f"Причина: {response.prompt_feedback.block_reason}"
+                block_reason = response.prompt_feedback.block_reason
+                reason = f"Причина: {block_reason}"
+                
+                # Считаем нарушением только явные причины:
+                # 3 = SAFETY, 4 = PROHIBITED_CONTENT, 2 = BLOCKLIST
+                if str(block_reason) in ('3', '4', '2', 'SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST'):
+                    is_safety_blocking = True
+            
             if user_logger:
                 user_logger.error(f"Пустой ответ от API (нет кандидатов). {reason}")
+
+            if is_safety_blocking:
+                return 'SAFETY', f"Контент заблокирован на уровне промпта. {reason}"
+
             return 'ERROR', f"Пустой ответ от API. {reason}"
 
         candidate = response.candidates[0]
