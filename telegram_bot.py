@@ -236,6 +236,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await learn_more(query, context)
     elif query.data == "check_another":
         await check_another(query, context)
+    elif query.data == "open_channel":
+        await open_channel(query, context)
 
 async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Пользователь согласился, просим загрузить креатив."""
@@ -262,6 +264,10 @@ async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.edit_message_text(text=upload_text, parse_mode=ParseMode.HTML)
 
 async def learn_more(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = query.from_user
+    user_logger = setup_user_logger(user.id)
+    user_logger.info(f"Пользователь {user.id} нажал кнопку 'Подробнее о правилах'.")
+
     text_part1 = (
         """ <b>Спасибо за ваш интерес к нашему проекту!</b> 
 Этот бот проверяет рекламные креативы на соответствие ФЗ «О рекламе», опираясь на 700 + свежих (вынесенных за прошедшие 2,5 года) решений ФАС. Он работает по принципу Retrieval‑Augmented Generation (RAG): сначала ищет похожие кейсы, затем формирует ответ, обращаясь к нейросети Gemini 2.5 Pro (или Gemini 2.5 Flash, если Pro вдруг срабатывает с ошибками. Эта модель считается более слабой, так как не является «думающей», но и она, по нашей оценке, даёт неплохие заключения).
@@ -343,6 +349,26 @@ async def check_another(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await query.message.reply_text(text=upload_text, parse_mode=ParseMode.HTML)
     await query.answer()
+
+
+async def open_channel(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик кнопки перехода в канал (для логирования)."""
+    user = query.from_user
+    user_logger = setup_user_logger(user.id)
+    
+    user_logger.info(f"Пользователь {user.id} нажал кнопку перехода в канал.")
+    
+    # Сразу отвечаем на колбэк, чтобы убрать часики
+    await query.answer()
+    
+    start_web_page_preview = True # Ссылку можно будет предпросмотреть, чтобы было красиво
+    
+    # Отправляем сообщение со ссылкой
+    await query.message.reply_text(
+        f"🔗 <a href='{CHANNEL_URL}'>Перейти в канал проекта</a>",
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=False
+    )
 
 async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Главный обработчик креативов с новой логикой обработки ошибок."""
@@ -493,7 +519,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 warning_text = "Нейросеть считает, что вы направили недопустимый запрос. Она может ошибаться и при повторном рассмотрении предоставить заключение. Попробуйте еще раз позднее"
                 keyboard = [
                     [InlineKeyboardButton("✅ Проверить креатив ещё раз", callback_data="check_another")],
-                    [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+                    [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", callback_data="open_channel")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 await update.message.reply_text(warning_text, reply_markup=reply_markup)
@@ -507,7 +533,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
             keyboard = [
                 [InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="check_another")],
-                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", callback_data="open_channel")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
@@ -531,7 +557,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             keyboard = [
                 [InlineKeyboardButton("✅ Проверить еще один креатив", callback_data="check_another")],
                 [InlineKeyboardButton("✍️ Дать обратную связь", callback_data="give_feedback")],
-                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", callback_data="open_channel")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
