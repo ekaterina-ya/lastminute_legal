@@ -4,7 +4,8 @@
 import os
 import pandas as pd
 import numpy as np
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import re
 from PIL import Image
 import io
@@ -48,17 +49,15 @@ class GeminiClient:
     При смене модели (на другую LLM) — менять только этот класс.
     """
     
-    SAFETY_SETTINGS = {
-        "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-        "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-        "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-        "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-    }
+    SAFETY_SETTINGS = [
+        types.SafetySetting(category='HARM_CATEGORY_HARASSMENT', threshold='BLOCK_NONE'),
+        types.SafetySetting(category='HARM_CATEGORY_HATE_SPEECH', threshold='BLOCK_NONE'),
+        types.SafetySetting(category='HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold='BLOCK_NONE'),
+        types.SafetySetting(category='HARM_CATEGORY_DANGEROUS_CONTENT', threshold='BLOCK_NONE'),
+    ]
     
     def __init__(self, api_key: str, primary_model: str, fallback_model: str, embedding_model: str):
-        genai.configure(api_key=api_key)
-        self._primary_model = genai.GenerativeModel(primary_model)
-        self._fallback_model = genai.GenerativeModel(fallback_model)
+        self._client = genai.Client(api_key=api_key)
         self._embedding_model_name = embedding_model
         self._primary_model_name = primary_model
         self._fallback_model_name = fallback_model
@@ -68,13 +67,13 @@ class GeminiClient:
         Генерация ответа от LLM с парсингом.
         Returns: dict: {status, text/message, model}
         """
-        model = self._fallback_model if use_fallback else self._primary_model
         model_name = self._fallback_model_name if use_fallback else self._primary_model_name
         
         try:
-            response = model.generate_content(
-                content,
-                safety_settings=self.SAFETY_SETTINGS
+            response = self._client.models.generate_content(
+                model=model_name,
+                contents=content,
+                config=types.GenerateContentConfig(safety_settings=self.SAFETY_SETTINGS)
             )
             
             status, result_text = self._parse_response(response, model_name, user_logger)
@@ -94,16 +93,16 @@ class GeminiClient:
     
     def embed(self, text: str) -> np.ndarray:
         """Создание эмбеддинга для текста."""
-        result = genai.embed_content(
+        result = self._client.models.embed_content(
             model=self._embedding_model_name,
-            content=text,
-            task_type="RETRIEVAL_QUERY"
+            contents=text,
+            config=types.EmbedContentConfig(task_type='RETRIEVAL_QUERY')
         )
-        return np.array(result['embedding']).reshape(1, -1)
+        return np.array(result.embeddings[0].values).reshape(1, -1)
     
     def upload_file(self, file_path: str, display_name: str = None):
         """Загрузка файла в Gemini Files API."""
-        return genai.upload_file(path=file_path, display_name=display_name)
+        return self._client.files.upload(file=file_path)
     
     def _parse_response(self, response, model_name: str, user_logger: logging.Logger = None) -> tuple:
         """
@@ -113,7 +112,7 @@ class GeminiClient:
         if user_logger and hasattr(response, 'usage_metadata'):
             user_logger.info(
                 f"[API RESPONSE - {model_name}]\n"
-                f"{json.dumps(response.to_dict(), ensure_ascii=False, indent=2)}"
+                f"{response.model_dump_json(exclude_none=True, indent=2)}"
             )
 
         if not response.candidates:
@@ -127,7 +126,7 @@ class GeminiClient:
         candidate = response.candidates[0]
         finish_reason = candidate.finish_reason
 
-        if finish_reason.name == 'STOP':
+        if finish_reason == 'STOP':
             if hasattr(candidate.content, 'parts') and candidate.content.parts:
                 full_text = "".join(part.text for part in candidate.content.parts)
                 if full_text.strip():
@@ -136,17 +135,17 @@ class GeminiClient:
                 user_logger.warning(f"finish_reason=STOP, но текст пустой")
             return 'ERROR', "Успешный статус от API, но пустой ответ."
 
-        if finish_reason.name in ('SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST'):
+        if finish_reason in ('SAFETY', 'PROHIBITED_CONTENT', 'BLOCKLIST'):
             safety_info = ""
             if hasattr(candidate, 'safety_ratings'):
                 safety_info = f"Safety Ratings: {candidate.safety_ratings}"
             if user_logger:
                 user_logger.warning(f"Запрос заблокирован по безопасности. {safety_info}")
-            return 'SAFETY', f"Контент заблокирован. Причина: {finish_reason.name}. {safety_info}"
+            return 'SAFETY', f"Контент заблокирован. Причина: {finish_reason}. {safety_info}"
 
         if user_logger:
-            user_logger.error(f"Техническая ошибка API. Finish Reason: {finish_reason.name}")
-        return 'ERROR', f"Техническая ошибка API. Finish Reason: {finish_reason.name}"
+            user_logger.error(f"Техническая ошибка API. Finish Reason: {finish_reason}")
+        return 'ERROR', f"Техническая ошибка API. Finish Reason: {finish_reason}"
 
 
 # ===============================================================
