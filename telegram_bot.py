@@ -16,6 +16,7 @@ from telegram.ext import (
 from telegram.constants import ParseMode
 import backend_logic as backend
 import aggregator
+from pypdf import PdfReader
 
 # --- Настройка логирования ---
 LOGS_DIR = os.getenv('LOGS_DIR', 'user_logs')
@@ -415,6 +416,31 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if doc.mime_type == 'application/pdf':
                 temp_file_path = os.path.join(LOGS_DIR, file_name)
                 await new_file.download_to_drive(temp_file_path)
+                
+                # Проверка количества страниц PDF
+                try:
+                    reader = PdfReader(temp_file_path)
+                    if len(reader.pages) > 5:
+                        await update.message.reply_text(
+                            "⚠️ В вашем PDF-файле больше 5 страниц.\n"
+                            "Пожалуйста, загрузите документ объемом до 5 страниц или отправьте его по частям в нескольких запросах к боту.",
+                            reply_markup=error_keyboard
+                        )
+                        # Удаляем временный файл
+                        os.remove(temp_file_path)
+                        # Сбрасываем флаг обработки
+                        context.user_data['is_processing'] = False
+                        return
+                except Exception as e:
+                    user_logger.warning(f"Ошибка при чтении PDF: {e}")
+                    await update.message.reply_text(
+                        "⚠️ Не удалось прочитать PDF-файл. Возможно, он поврежден или зашифрован.",
+                        reply_markup=error_keyboard
+                    )
+                    if os.path.exists(temp_file_path):
+                        os.remove(temp_file_path)
+                    context.user_data['is_processing'] = False
+                    return
             else:
                 file_bytes = bytes(await new_file.download_as_bytearray())
         
