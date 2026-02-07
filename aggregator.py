@@ -68,6 +68,8 @@ def parse_request_block(block_text, user_id, username):
         
         # Данные по API и моделям (ЗАПРОШЕННЫЕ)
         'total_tokens': 0,
+        'prompt_tokens': 0,
+        'output_tokens': 0,
         'model_used': None,
         'is_error': False,
         'error_details': None,
@@ -122,9 +124,15 @@ def parse_request_block(block_text, user_id, username):
         search_results = re.findall(r'CaseID: ([\w-]+)', match_search.group(1))
         data['semantic_search_top10'] = ", ".join(search_results)
 
-    # Токены (суммируем все)
-    token_counts = re.findall(r'"total_token_count": (\d+)', block_text)
+    # Токены (суммируем все) - поддержка обоих форматов: с кавычками (JSON) и без
+    token_counts = re.findall(r'"?total_token_count"?: (\d+)', block_text)
     data['total_tokens'] = sum(int(t) for t in token_counts)
+    
+    # Токены по типам (input/output)
+    prompt_counts = re.findall(r'"?prompt_token_count"?: (\d+)', block_text)
+    data['prompt_tokens'] = sum(int(t) for t in prompt_counts)
+    output_counts = re.findall(r'"?candidates_token_count"?: (\d+)', block_text)
+    data['output_tokens'] = sum(int(t) for t in output_counts)
 
     # Обратная связь
     match_feedback = re.search(r'--- ОБРАТНАЯ СВЯЗЬ ---\n(\{.*?\})', block_text, re.DOTALL)
@@ -261,6 +269,8 @@ def generate_summary_report(df, db_path):
 
     # 5. Потрачено токенов
     daily_total_tokens = int(df_today['total_tokens'].sum())
+    daily_prompt_tokens = int(df_today['prompt_tokens'].sum())
+    daily_output_tokens = int(df_today['output_tokens'].sum())
 
     # 6. Среднее кол-во токенов на запрос
     avg_tokens_per_request = daily_total_tokens / daily_requests if daily_requests > 0 else 0
@@ -293,6 +303,7 @@ def generate_summary_report(df, db_path):
 
 🤖 *API и Расходы:*
 • Потрачено токенов: *{daily_total_tokens:,}*
+  ↳ input: *{daily_prompt_tokens:,}* / output: *{daily_output_tokens:,}*
 • В среднем на запрос: *{int(avg_tokens_per_request)}* токенов
 
 📝 *Обратная связь:*
@@ -308,6 +319,9 @@ def generate_summary_report(df, db_path):
 • Блокировки: *{len(blocked_messages)}*
 {chr(10).join(blocked_messages) if blocked_messages else '  Блокировок за сегодня не зафиксировано.'}
 """
+    # Логируем отчет с экранированием для читаемости в терминале
+    escaped_report = report.replace('*', '\\*').replace('_', '\\_')
+    logger.info(f"Сгенерированный отчет:\n{escaped_report}")
     return report.replace(',', ' ') # Убираем запятую из чисел для Markdown
 
 def send_telegram_message(token, chat_id, text):
@@ -335,7 +349,8 @@ def send_telegram_message(token, chat_id, text):
         response.raise_for_status()
         logger.info("Отчет успешно отправлен в Telegram.")
     except requests.exceptions.RequestException as e:
-        logger.error(f"Не удалось отправить отчет в Telegram после нескольких попыток: {e}")
+        escaped_text = text.replace('*', '\\*').replace('_', '\\_')
+        logger.error(f"Не удалось отправить отчет в Telegram после нескольких попыток: {e}\nТекст отчета:\n{escaped_text}")
 
 # ===============================================================
 # БЛОК 5: ТОЧКА ВХОДА
