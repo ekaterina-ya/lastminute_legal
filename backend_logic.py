@@ -295,6 +295,63 @@ def format_rag_context(search_results_df):
         )
     return "\n---\n".join(context_parts)
 
+def sanitize_html(text: str) -> str:
+    """
+    Приводит текст к валидному подмножеству HTML, поддерживаемому Telegram.
+    Telegram поддерживает: b, strong, i, em, u, ins, s, strike, del, code, pre, a href, tg-spoiler.
+    Всё остальное (включая < и > в тексте) нужно экранировать.
+    """
+    import html as html_module
+    
+    # Шаг 1: Выделяем разрешённые теги, экранируем всё остальное
+    ALLOWED_TAGS_PATTERN = re.compile(
+        r'(</?(b|strong|i|em|u|ins|s|strike|del|code|tg-spoiler)>)'
+        r'|(<a\s+href="[^"]*">)'
+        r"|(<a\s+href='[^']*'>)"
+        r'|(</a>)'
+        r'|(<pre(?:\s+language="[^"]*")?>)'
+        r'|(</pre>)',
+        re.IGNORECASE
+    )
+    
+    parts = []
+    last_end = 0
+    for match in ALLOWED_TAGS_PATTERN.finditer(text):
+        start, end = match.span()
+        if start > last_end:
+            parts.append(html_module.escape(text[last_end:start]))
+        parts.append(match.group(0))
+        last_end = end
+    if last_end < len(text):
+        parts.append(html_module.escape(text[last_end:]))
+    
+    result = ''.join(parts)
+    
+    # Шаг 2: Конвертируем Markdown в HTML
+    result = re.sub(r'^#{1,6}\s+(.+)$', r'<b>\1</b>', result, flags=re.MULTILINE)
+    result = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', result)
+    result = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', result)
+    
+    # Шаг 3: Починить незакрытые теги
+    simple_tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'tg-spoiler']
+    for tag in simple_tags:
+        open_count = len(re.findall(f'<{tag}(?:\\s[^>]*)?>', result, re.IGNORECASE))
+        close_count = len(re.findall(f'</{tag}>', result, re.IGNORECASE))
+        for _ in range(open_count - close_count):
+            result += f'</{tag}>'
+        for _ in range(close_count - open_count):
+            result = re.sub(f'</{tag}>', '', result, count=1, flags=re.IGNORECASE)
+    
+    open_a = len(re.findall(r'<a\s', result, re.IGNORECASE))
+    close_a = len(re.findall(r'</a>', result, re.IGNORECASE))
+    for _ in range(open_a - close_a):
+        result += '</a>'
+    for _ in range(close_a - open_a):
+        result = re.sub(r'</a>', '', result, count=1, flags=re.IGNORECASE)
+    
+    return result
+
+
 def postprocess_final_answer(final_text):
     """Шаг 4: Постобработка - добавление ссылок и дисклеймера."""
     print("Шаг 4: Пост-обработка ответа...")
@@ -328,6 +385,9 @@ def postprocess_final_answer(final_text):
 
     # Применяем замену ко всему тексту с помощью созданного шаблона.
     processed_text = pattern.sub(replace_with_link, final_text)
+    
+    # Санитизация HTML: экранируем невалидные символы < и >, оставляя только разрешённые теги
+    processed_text = sanitize_html(processed_text)
     
     DISCLAIMER = """
 

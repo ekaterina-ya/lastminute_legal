@@ -6,6 +6,7 @@ import logging
 import sqlite3
 import pytz
 import asyncio
+import re
 from datetime import datetime, time, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
@@ -511,12 +512,21 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             TELEGRAM_MAX_LENGTH = 4000
             
             if len(full_message) <= TELEGRAM_MAX_LENGTH:
-                await update.message.reply_text(
-                    full_message, 
-                    reply_markup=reply_markup, 
-                    parse_mode=ParseMode.HTML, 
-                    disable_web_page_preview=True
-                )
+                try:
+                    await update.message.reply_text(
+                        full_message, 
+                        reply_markup=reply_markup, 
+                        parse_mode=ParseMode.HTML, 
+                        disable_web_page_preview=True
+                    )
+                except Exception as html_err:
+                    logger.warning(f"HTML parse error, sending without formatting: {html_err}")
+                    plain_text = re.sub(r'<[^>]+>', '', full_message)
+                    await update.message.reply_text(
+                        plain_text, 
+                        reply_markup=reply_markup, 
+                        disable_web_page_preview=True
+                    )
             else:
                 parts = []
                 current_part = ""
@@ -530,21 +540,40 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                 for part in parts[:-1]:
                     if part.strip():
+                        try:
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id, 
+                                text=part, 
+                                parse_mode=ParseMode.HTML, 
+                                disable_web_page_preview=True
+                            )
+                        except Exception as html_err:
+                            logger.warning(f"HTML parse error in message part, sending without formatting: {html_err}")
+                            plain_part = re.sub(r'<[^>]+>', '', part)
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id, 
+                                text=plain_part, 
+                                disable_web_page_preview=True
+                            )
+                
+                if parts[-1].strip():
+                    try:
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id, 
-                            text=part, 
+                            text=parts[-1], 
+                            reply_markup=reply_markup, 
                             parse_mode=ParseMode.HTML, 
                             disable_web_page_preview=True
                         )
-                
-                if parts[-1].strip():
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id, 
-                        text=parts[-1], 
-                        reply_markup=reply_markup, 
-                        parse_mode=ParseMode.HTML, 
-                        disable_web_page_preview=True
-                    )
+                    except Exception as html_err:
+                        logger.warning(f"HTML parse error in last message part, sending without formatting: {html_err}")
+                        plain_last = re.sub(r'<[^>]+>', '', parts[-1])
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id, 
+                            text=plain_last, 
+                            reply_markup=reply_markup, 
+                            disable_web_page_preview=True
+                        )
 
     except Exception as e:
         # Этот блок ловит ошибки, возникшие внутри самого бота, а не в бэкенде
