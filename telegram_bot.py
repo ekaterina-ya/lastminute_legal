@@ -440,7 +440,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             file_name = doc.file_name
             new_file = await context.bot.get_file(file_id)
             if doc.mime_type == 'application/pdf':
-                temp_file_path = os.path.join(LOGS_DIR, file_name)
+                temp_file_path = os.path.join(LOGS_DIR, f"{user.id}_{int(datetime.now().timestamp())}.pdf")
                 await new_file.download_to_drive(temp_file_path)
                 
                 # Проверка количества страниц PDF
