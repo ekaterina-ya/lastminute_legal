@@ -519,6 +519,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 warning_text = "Нейросеть считает, что вы направили недопустимый запрос. Она может ошибаться и при повторном рассмотрении предоставить заключение. Попробуйте еще раз позднее"
                 keyboard = [
                     [InlineKeyboardButton("✅ Проверить креатив ещё раз", callback_data="check_another")],
+                    [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
                     [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", callback_data="open_channel")]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -533,6 +534,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             
             keyboard = [
                 [InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="check_another")],
+                [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
                 [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", callback_data="open_channel")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
@@ -557,6 +559,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             keyboard = [
                 [InlineKeyboardButton("✅ Проверить еще один креатив", callback_data="check_another")],
                 [InlineKeyboardButton("✍️ Дать обратную связь", callback_data="give_feedback")],
+                [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
                 [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", callback_data="open_channel")]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
