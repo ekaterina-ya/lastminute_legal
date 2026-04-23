@@ -11,6 +11,7 @@ from PIL import Image
 import io
 import logging
 import json
+import asyncio
 
 # --- Глобальные переменные для кеширования ---
 rag_df = None
@@ -65,15 +66,15 @@ class GeminiClient:
         self._primary_model_name = primary_model
         self._fallback_model_name = fallback_model
     
-    def generate(self, content: list, use_fallback: bool = False, user_logger: logging.Logger = None) -> dict:
+    async def generate(self, content: list, use_fallback: bool = False, user_logger: logging.Logger = None) -> dict:
         """
         Генерация ответа от LLM с парсингом.
         Returns: dict: {status, text/message, model}
         """
         model_name = self._fallback_model_name if use_fallback else self._primary_model_name
-        
+
         try:
-            response = self._client.models.generate_content(
+            response = await self._client.aio.models.generate_content(
                 model=model_name,
                 contents=content,
                 config=types.GenerateContentConfig(safety_settings=self.SAFETY_SETTINGS)
@@ -94,18 +95,18 @@ class GeminiClient:
                 user_logger.error(error_msg)
             return {"status": "ERROR", "message": error_msg, "model": model_name}
     
-    def embed(self, text: str) -> np.ndarray:
+    async def embed(self, text: str) -> np.ndarray:
         """Создание эмбеддинга для текста."""
-        result = self._client.models.embed_content(
+        result = await self._client.aio.models.embed_content(
             model=self._embedding_model_name,
             contents=text,
             config=types.EmbedContentConfig(task_type='RETRIEVAL_QUERY')
         )
         return np.array(result.embeddings[0].values).reshape(1, -1)
     
-    def upload_file(self, file_path: str, display_name: str = None):
+    async def upload_file(self, file_path: str, display_name: str = None):
         """Загрузка файла в Gemini Files API."""
-        return self._client.files.upload(file=file_path)
+        return await asyncio.to_thread(self._client.files.upload, file=file_path)
     
     def _parse_response(self, response, model_name: str, user_logger: logging.Logger = None) -> tuple:
         """
@@ -268,11 +269,11 @@ def build_user_content(image: Image.Image = None, text: str = "") -> list:
 # БЛОК 5: ОСНОВНЫЕ ФУНКЦИИ БЭКЭНДА (ШАГИ АНАЛИЗА)
 # ===============================================================
 
-def semantic_search(query_text: str, user_logger: logging.Logger = None):
+async def semantic_search(query_text: str, user_logger: logging.Logger = None):
     """Шаг 2: Семантический поиск релевантных кейсов."""
     print(f"Шаг 2: Поиск {RAG_TOP_N} релевантных кейсов...")
     try:
-        query_embedding = gemini_client.embed(query_text)
+        query_embedding = await gemini_client.embed(query_text)
         similarities = np.dot(corpus_embeddings, query_embedding.T).flatten()
 
         top_10_indices_for_logging = np.argsort(similarities)[-10:][::-1]
@@ -430,6 +431,24 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
     Основной пайплайн анализа. Принимает данные от бота, возвращает словарь с результатом.
     """
     try:
+        # DIAG-START (временная диагностика блокировок event loop)
+        import asyncio as _diag_asyncio
+        import time as _diag_time
+        _diag_last = [_diag_time.monotonic()]
+        _diag_stop = False
+
+        async def _diag_heartbeat():
+            while not _diag_stop:
+                await _diag_asyncio.sleep(0.1)
+                now = _diag_time.monotonic()
+                delta = now - _diag_last[0]
+                if delta > 0.5:
+                    print(f"[HEARTBEAT] event loop был заблокирован {delta:.2f}s (ожидалось ~0.1s)", flush=True)
+                _diag_last[0] = now
+
+        _diag_hb_task = _diag_asyncio.create_task(_diag_heartbeat())
+        print(f"[HEARTBEAT] monitor started for user {user_id}", flush=True)
+        # DIAG-END
         # Определяем, какую модель использовать
         use_fallback = (model_to_use == 'fallback')
         model_name_for_log = "Fallback (Flash)" if use_fallback else "Primary (Pro)"
@@ -441,7 +460,7 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
 
         if file_path and file_path.lower().endswith('.pdf'):
             print(f"Загрузка PDF файла: {original_filename}")
-            uploaded_file = gemini_client.upload_file(file_path, display_name=original_filename)
+            uploaded_file = await gemini_client.upload_file(file_path, display_name=original_filename)
             user_content_for_api = build_user_content(text=text_content, image=uploaded_file)
         else:
             if file_bytes:
@@ -460,9 +479,14 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         # 1. Предварительная обработка контента через GeminiClient
         print("Шаг 1: Предварительная обработка контента...")
         content_for_preprocessing = [PROMPT_1_PREPROCESSING] + user_content_for_api
-        preprocess_result = gemini_client.generate(content_for_preprocessing, use_fallback=use_fallback, user_logger=user_logger)
+        preprocess_result = await gemini_client.generate(content_for_preprocessing, use_fallback=use_fallback, user_logger=user_logger)
         
         if preprocess_result["status"] == "SAFETY":
+            # DIAG-START
+            _diag_stop = True
+            _diag_hb_task.cancel()
+            print(f"[HEARTBEAT] monitor stopped for user {user_id}", flush=True)
+            # DIAG-END
             return {"error_type": "safety", "message": preprocess_result["message"], "model_used": model_to_use}
         if preprocess_result["status"] == "ERROR":
             raise Exception(f"Ошибка предобработки: {preprocess_result['message']}")
@@ -470,16 +494,21 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         processed_text = preprocess_result["text"]
 
         # 2. Поиск в RAG
-        rag_results = semantic_search(processed_text, user_logger=user_logger)
+        rag_results = await semantic_search(processed_text, user_logger=user_logger)
         rag_context = format_rag_context(rag_results)
         
         # 3. Финальный анализ через GeminiClient
         print("Шаг 3: Генерация финального юридического заключения...")
         final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
         final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
-        final_result = gemini_client.generate([final_prompt], use_fallback=use_fallback, user_logger=user_logger)
+        final_result = await gemini_client.generate([final_prompt], use_fallback=use_fallback, user_logger=user_logger)
         
         if final_result["status"] == "SAFETY":
+            # DIAG-START
+            _diag_stop = True
+            _diag_hb_task.cancel()
+            print(f"[HEARTBEAT] monitor stopped for user {user_id}", flush=True)
+            # DIAG-END
             return {"error_type": "safety", "message": final_result["message"], "model_used": model_to_use}
         if final_result["status"] == "ERROR":
             raise Exception(f"Ошибка финального анализа: {final_result['message']}")
@@ -489,6 +518,11 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         # 4. Пост-обработка
         final_output = postprocess_final_answer(final_text)
         
+        # DIAG-START
+        _diag_stop = True
+        _diag_hb_task.cancel()
+        print(f"[HEARTBEAT] monitor stopped for user {user_id}", flush=True)
+        # DIAG-END
         return {
             "final_output": final_output,
             "preprocessed_text": processed_text,
@@ -501,4 +535,9 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         if user_logger:
             user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА в `analyze_creative_flow` с моделью {model_to_use}: {e}", exc_info=True)
         # Возвращаем словарь, который бот сможет обработать как техническую ошибку
+        # DIAG-START
+        _diag_stop = True
+        _diag_hb_task.cancel()
+        print(f"[HEARTBEAT] monitor stopped for user {user_id}", flush=True)
+        # DIAG-END
         return {"error_type": "technical", "message": str(e), "model_used": model_to_use}

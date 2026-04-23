@@ -229,6 +229,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик нажатий на основные inline-кнопки."""
     query = update.callback_query
+    if query.data in ("agree_and_upload", "check_another"):
+        lock = context.user_data.get("analysis_lock")
+        if lock and lock.locked():
+            await query.answer("Идёт анализ, дождитесь результата", show_alert=False)
+            return
     await query.answer()
     if query.data == "agree_and_upload":
         await agree_and_upload(query, context)
@@ -247,7 +252,6 @@ async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     context.user_data['awaiting_creative'] = True
-    context.user_data['is_processing'] = False
     upload_text = (
         f"""-------------
 Отлично! Остаток проверок на сегодня: <b>{remaining}</b>.
@@ -343,8 +347,7 @@ async def check_another(query, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     context.user_data['awaiting_creative'] = True
-    context.user_data['is_processing'] = False
-    
+
     upload_text = f"Остаток проверок на сегодня: <b>{remaining}</b>.\n\n Отправьте мне изображение, PDF или текст вашего креатива."
 
     await query.message.reply_text(text=upload_text, parse_mode=ParseMode.HTML)
@@ -357,8 +360,10 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.message.from_user
     user_logger = setup_user_logger(user.id)
 
-    if context.user_data.get('is_processing', False):
+    lock = context.user_data.setdefault("analysis_lock", asyncio.Lock())
+    if lock.locked():
         user_logger.info("Запрос получен во время обработки предыдущего. Игнорируется.")
+        await update.message.reply_text("Ваш предыдущий креатив ещё анализируется, дождитесь результата.")
         return
 
     if not context.user_data.get('awaiting_creative', False):
@@ -372,255 +377,231 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_logger.warning("Попытка запроса при исчерпанном лимите.")
         return
 
-    context.user_data['is_processing'] = True
-    context.user_data['awaiting_creative'] = False
+    async with lock:
+        context.user_data['awaiting_creative'] = False
 
-    error_text = f"Проверьте ваш файл: поддерживаются только файлы формата .jpg, .png и .pdf. не более {MAX_FILE_SIZE_MB} МБ."
-    error_keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Попробовать еще раз", callback_data="check_another")]
-    ])
-    
-    temp_file_path = None
-    try:
-        if is_user_blocked(user.id):
-            user_logger.warning("Попытка запроса от заблокированного пользователя.")
-            return
+        error_text = f"Проверьте ваш файл: поддерживаются только файлы формата .jpg, .png и .pdf. не более {MAX_FILE_SIZE_MB} МБ."
+        error_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Попробовать еще раз", callback_data="check_another")]
+        ])
 
-        user_logger.info(f"--- Новый запрос от пользователя {user.first_name} (@{user.username}) ---")
-
-        await update.message.reply_text("Креатив принят в работу, подготовка ответа может занять до 5 минут ⏳")
-        
-        text_content = update.message.text or update.message.caption or ""
-        file_bytes, file_name = None, None
-
-        if update.message.photo:
-            photo = update.message.photo[-1]
-            # 2. Проверяем размер фото
-            if photo.file_size > MAX_FILE_SIZE_BYTES:
-                await update.message.reply_text(error_text, reply_markup=error_keyboard)
-                # Сбрасываем флаг обработки, чтобы пользователь мог сразу отправить новый файл
-                context.user_data['is_processing'] = False
+        temp_file_path = None
+        try:
+            if is_user_blocked(user.id):
+                user_logger.warning("Попытка запроса от заблокированного пользователя.")
                 return
 
-            file_id = photo.file_id
-            file_name = f"{user.id}_{datetime.now().timestamp()}.jpg"
-            new_file = await context.bot.get_file(file_id)
-            file_bytes = bytes(await new_file.download_as_bytearray())
-            
-        elif update.message.document:
-            doc = update.message.document
+            user_logger.info(f"--- Новый запрос от пользователя {user.first_name} (@{user.username}) ---")
 
-            # 3. Единая проверка формата и размера для документа
-            if doc.file_size > MAX_FILE_SIZE_BYTES or doc.mime_type not in ['application/pdf', 'image/jpeg', 'image/png']:
-                await update.message.reply_text(error_text, reply_markup=error_keyboard)
-                # Сбрасываем флаг обработки
-                context.user_data['is_processing'] = False
-                return
+            await update.message.reply_text("Креатив принят в работу, подготовка ответа может занять до 5 минут ⏳")
 
-            # Если проверки пройдены, продолжаем как обычно
-            file_id = doc.file_id
-            file_name = doc.file_name
-            new_file = await context.bot.get_file(file_id)
-            if doc.mime_type == 'application/pdf':
-                temp_file_path = os.path.join(LOGS_DIR, f"{user.id}_{int(datetime.now().timestamp())}.pdf")
-                await new_file.download_to_drive(temp_file_path)
-                
-                # Проверка количества страниц PDF
-                try:
-                    reader = PdfReader(temp_file_path)
-                    if len(reader.pages) > 5:
+            text_content = update.message.text or update.message.caption or ""
+            file_bytes, file_name = None, None
+
+            if update.message.photo:
+                photo = update.message.photo[-1]
+                if photo.file_size > MAX_FILE_SIZE_BYTES:
+                    await update.message.reply_text(error_text, reply_markup=error_keyboard)
+                    return
+
+                file_id = photo.file_id
+                file_name = f"{user.id}_{datetime.now().timestamp()}.jpg"
+                new_file = await context.bot.get_file(file_id)
+                file_bytes = bytes(await new_file.download_as_bytearray())
+
+            elif update.message.document:
+                doc = update.message.document
+
+                if doc.file_size > MAX_FILE_SIZE_BYTES or doc.mime_type not in ['application/pdf', 'image/jpeg', 'image/png']:
+                    await update.message.reply_text(error_text, reply_markup=error_keyboard)
+                    return
+
+                file_id = doc.file_id
+                file_name = doc.file_name
+                new_file = await context.bot.get_file(file_id)
+                if doc.mime_type == 'application/pdf':
+                    temp_file_path = os.path.join(LOGS_DIR, f"{user.id}_{int(datetime.now().timestamp())}.pdf")
+                    await new_file.download_to_drive(temp_file_path)
+
+                    try:
+                        reader = PdfReader(temp_file_path)
+                        if len(reader.pages) > 5:
+                            await update.message.reply_text(
+                                "⚠️ В вашем PDF-файле больше 5 страниц.\n"
+                                "Пожалуйста, загрузите документ объемом до 5 страниц или отправьте его по частям в нескольких запросах к боту.",
+                                reply_markup=error_keyboard
+                            )
+                            os.remove(temp_file_path)
+                            return
+                    except Exception as e:
+                        user_logger.warning(f"Ошибка при чтении PDF: {e}")
                         await update.message.reply_text(
-                            "⚠️ В вашем PDF-файле больше 5 страниц.\n"
-                            "Пожалуйста, загрузите документ объемом до 5 страниц или отправьте его по частям в нескольких запросах к боту.",
+                            "⚠️ Не удалось прочитать PDF-файл. Возможно, он поврежден или зашифрован.",
                             reply_markup=error_keyboard
                         )
-                        # Удаляем временный файл
-                        os.remove(temp_file_path)
-                        # Сбрасываем флаг обработки
-                        context.user_data['is_processing'] = False
+                        if os.path.exists(temp_file_path):
+                            os.remove(temp_file_path)
                         return
-                except Exception as e:
-                    user_logger.warning(f"Ошибка при чтении PDF: {e}")
-                    await update.message.reply_text(
-                        "⚠️ Не удалось прочитать PDF-файл. Возможно, он поврежден или зашифрован.",
-                        reply_markup=error_keyboard
-                    )
-                    if os.path.exists(temp_file_path):
-                        os.remove(temp_file_path)
-                    context.user_data['is_processing'] = False
-                    return
-            else:
-                file_bytes = bytes(await new_file.download_as_bytearray())
-        
-        # --- КОНЕЦ ИЗМЕНЕНИЙ ---
+                else:
+                    file_bytes = bytes(await new_file.download_as_bytearray())
 
-        if not file_bytes and not text_content and not temp_file_path:
-            # Важно сбросить флаг, если пользователь отправил пустое сообщение
-            context.user_data['is_processing'] = False
-            return
-            
-       # --- ШАГ 1: Первая попытка с основной моделью ---
-        analysis_result = await backend.analyze_creative_flow(
-            file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path, 
-            original_filename=file_name, user_id=user.id, user_logger=user_logger, model_to_use='primary'
-        )
-        
-        error_type = analysis_result.get("error_type")
+            if not file_bytes and not text_content and not temp_file_path:
+                return
 
-        # --- ШАГ 2: Если техническая ошибка, пробуем fallback-модель ---
-        if error_type == "technical":
-            primary_error_message = analysis_result.get("message", "Неизвестная ошибка")
-            logger.error(f"Техническая ошибка (primary) для user {user.id}: {primary_error_message}")
-            if ADMIN_USER_ID:
-                await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде (primary) у пользователя {user.id} (@{user.username})!\nОшибка: {primary_error_message}\n\nЗапускаю fallback-модель...")
-
-            await update.message.reply_text(
-                "Приносим извинения, нейросеть Gemini 2.5 Pro не сработала из-за проблем на стороне Google. Мы подготовим заключение с нейросетью Gemini 2.5 Flash. Gemini 2.5 Pro скорее всего скоро починят, можете попробовать еще раз позднее."
-            )
-            # Повторный вызов с fallback-моделью
+            # --- ШАГ 1: Первая попытка с основной моделью ---
             analysis_result = await backend.analyze_creative_flow(
-                file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path, 
-                original_filename=file_name, user_id=user.id, user_logger=user_logger, model_to_use='fallback'
+                file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path,
+                original_filename=file_name, user_id=user.id, user_logger=user_logger, model_to_use='primary'
             )
-            error_type = analysis_result.get("error_type") # Обновляем тип ошибки
 
-        # --- ШАГ 3: Финальная обработка результата (от первой или второй попытки) ---
-        if error_type == "safety":
-            was_just_blocked = handle_safety_violation(user.id, user.username)
-            if was_just_blocked:
-                # Пользователь только что был заблокирован
-                block_text = "Ваш доступ к боту был заблокирован. Нейросеть может ошибаться в своей оценке загруженного вами контента. Если вы считаете, что произошла ошибка, свяжитесь с администратором."
-                keyboard = []
-                if ADMIN_CONTACT_URL:
-                     keyboard.append([InlineKeyboardButton("Связаться с администратором", url=ADMIN_CONTACT_URL)])
-                
-                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-                await update.message.reply_text(block_text, reply_markup=reply_markup)
-            else:
-                # Еще не заблокирован, просто предупреждение
-                warning_text = "Нейросеть считает, что вы направили недопустимый запрос. Она может ошибаться и при повторном рассмотрении предоставить заключение. Попробуйте еще раз позднее"
+            error_type = analysis_result.get("error_type")
+
+            # --- ШАГ 2: Если техническая ошибка, пробуем fallback-модель ---
+            if error_type == "technical":
+                primary_error_message = analysis_result.get("message", "Неизвестная ошибка")
+                logger.error(f"Техническая ошибка (primary) для user {user.id}: {primary_error_message}")
+                if ADMIN_USER_ID:
+                    await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде (primary) у пользователя {user.id} (@{user.username})!\nОшибка: {primary_error_message}\n\nЗапускаю fallback-модель...")
+
+                await update.message.reply_text(
+                    "Приносим извинения, нейросеть Gemini 2.5 Pro не сработала из-за проблем на стороне Google. Мы подготовим заключение с нейросетью Gemini 2.5 Flash. Gemini 2.5 Pro скорее всего скоро починят, можете попробовать еще раз позднее."
+                )
+                analysis_result = await backend.analyze_creative_flow(
+                    file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path,
+                    original_filename=file_name, user_id=user.id, user_logger=user_logger, model_to_use='fallback'
+                )
+                error_type = analysis_result.get("error_type")
+
+            # --- ШАГ 3: Финальная обработка результата (от первой или второй попытки) ---
+            if error_type == "safety":
+                was_just_blocked = handle_safety_violation(user.id, user.username)
+                if was_just_blocked:
+                    block_text = "Ваш доступ к боту был заблокирован. Нейросеть может ошибаться в своей оценке загруженного вами контента. Если вы считаете, что произошла ошибка, свяжитесь с администратором."
+                    keyboard = []
+                    if ADMIN_CONTACT_URL:
+                        keyboard.append([InlineKeyboardButton("Связаться с администратором", url=ADMIN_CONTACT_URL)])
+                    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+                    await update.message.reply_text(block_text, reply_markup=reply_markup)
+                else:
+                    warning_text = "Нейросеть считает, что вы направили недопустимый запрос. Она может ошибаться и при повторном рассмотрении предоставить заключение. Попробуйте еще раз позднее"
+                    keyboard = [
+                        [InlineKeyboardButton("✅ Проверить креатив ещё раз", callback_data="check_another")],
+                        [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
+                        [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(warning_text, reply_markup=reply_markup)
+
+            elif error_type == "technical":
+                final_error_message = analysis_result.get("message", "Неизвестная ошибка")
+                logger.critical(f"ОБЕ МОДЕЛИ НЕ СРАБОТАЛИ для user {user.id}: {final_error_message}")
+                if ADMIN_USER_ID:
+                    await context.bot.send_message(ADMIN_USER_ID, f"КРИТИЧЕСКАЯ АВАРИЯ! Fallback-модель тоже не сработала у пользователя {user.id} (@{user.username})!\nОшибка: {final_error_message}")
+
                 keyboard = [
-                    [InlineKeyboardButton("✅ Проверить креатив ещё раз", callback_data="check_another")],
+                    [InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="check_another")],
                     [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
                     [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
-                await update.message.reply_text(warning_text, reply_markup=reply_markup)
+                await update.message.reply_text(
+                    "Приносим извинения, произошел серьезный сбой на стороне Google. Пожалуйста, попробуйте загрузить креатив позднее.",
+                    reply_markup=reply_markup
+                )
 
-        elif error_type == "technical":
-            # Сюда мы попадаем, только если и fallback-модель не сработала
-            final_error_message = analysis_result.get("message", "Неизвестная ошибка")
-            logger.critical(f"ОБЕ МОДЕЛИ НЕ СРАБОТАЛИ для user {user.id}: {final_error_message}")
-            if ADMIN_USER_ID:
-                await context.bot.send_message(ADMIN_USER_ID, f"КРИТИЧЕСКАЯ АВАРИЯ! Fallback-модель тоже не сработала у пользователя {user.id} (@{user.username})!\nОшибка: {final_error_message}")
-            
-            keyboard = [
-                [InlineKeyboardButton("✅ Попробовать ещё раз", callback_data="check_another")],
-                [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
-                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                "Приносим извинения, произошел серьезный сбой на стороне Google. Пожалуйста, попробуйте загрузить креатив позднее.",
-                reply_markup=reply_markup
-            )
-
-        else:
-            # Успешное выполнение
-            check_and_update_limit(user.id) # Списываем лимит только при успехе
-            reset_consecutive_blocks(user.id)
-            
-            model_used = analysis_result.get("model_used", "unknown")
-            if model_used == 'fallback' and ADMIN_USER_ID:
-                 await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} (@{user.username}) успешно подготовлено с помощью fallback-модели после сбоя основной.")
-            
-            final_output = analysis_result.get('final_output', "Произошла внутренняя ошибка.")
-            user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ ({model_used})]: {final_output}")
-            full_message = final_output
-            
-            keyboard = [
-                [InlineKeyboardButton("✅ Проверить еще один креатив", callback_data="check_another")],
-                [InlineKeyboardButton("✍️ Дать обратную связь", callback_data="give_feedback")],
-                [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
-                [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            TELEGRAM_MAX_LENGTH = 4000
-            
-            if len(full_message) <= TELEGRAM_MAX_LENGTH:
-                try:
-                    await update.message.reply_text(
-                        full_message, 
-                        reply_markup=reply_markup, 
-                        parse_mode=ParseMode.HTML, 
-                        disable_web_page_preview=True
-                    )
-                except Exception as html_err:
-                    logger.warning(f"HTML parse error, sending without formatting: {html_err}")
-                    plain_text = re.sub(r'<[^>]+>', '', full_message)
-                    await update.message.reply_text(
-                        plain_text, 
-                        reply_markup=reply_markup, 
-                        disable_web_page_preview=True
-                    )
             else:
-                parts = []
-                current_part = ""
-                for line in full_message.splitlines(True):
-                    if len(current_part) + len(line) > TELEGRAM_MAX_LENGTH:
-                        parts.append(current_part)
-                        current_part = line
-                    else:
-                        current_part += line
-                parts.append(current_part)
+                # Успешное выполнение
+                check_and_update_limit(user.id)
+                reset_consecutive_blocks(user.id)
 
-                for part in parts[:-1]:
-                    if part.strip():
-                        try:
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id, 
-                                text=part, 
-                                parse_mode=ParseMode.HTML, 
-                                disable_web_page_preview=True
-                            )
-                        except Exception as html_err:
-                            logger.warning(f"HTML parse error in message part, sending without formatting: {html_err}")
-                            plain_part = re.sub(r'<[^>]+>', '', part)
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id, 
-                                text=plain_part, 
-                                disable_web_page_preview=True
-                            )
-                
-                if parts[-1].strip():
+                model_used = analysis_result.get("model_used", "unknown")
+                if model_used == 'fallback' and ADMIN_USER_ID:
+                    await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} (@{user.username}) успешно подготовлено с помощью fallback-модели после сбоя основной.")
+
+                final_output = analysis_result.get('final_output', "Произошла внутренняя ошибка.")
+                user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ ({model_used})]: {final_output}")
+                full_message = final_output
+
+                keyboard = [
+                    [InlineKeyboardButton("✅ Проверить еще один креатив", callback_data="check_another")],
+                    [InlineKeyboardButton("✍️ Дать обратную связь", callback_data="give_feedback")],
+                    [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
+                    [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+
+                TELEGRAM_MAX_LENGTH = 4000
+
+                if len(full_message) <= TELEGRAM_MAX_LENGTH:
                     try:
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id, 
-                            text=parts[-1], 
-                            reply_markup=reply_markup, 
-                            parse_mode=ParseMode.HTML, 
+                        await update.message.reply_text(
+                            full_message,
+                            reply_markup=reply_markup,
+                            parse_mode=ParseMode.HTML,
                             disable_web_page_preview=True
                         )
                     except Exception as html_err:
-                        logger.warning(f"HTML parse error in last message part, sending without formatting: {html_err}")
-                        plain_last = re.sub(r'<[^>]+>', '', parts[-1])
-                        await context.bot.send_message(
-                            chat_id=update.effective_chat.id, 
-                            text=plain_last, 
-                            reply_markup=reply_markup, 
+                        logger.warning(f"HTML parse error, sending without formatting: {html_err}")
+                        plain_text = re.sub(r'<[^>]+>', '', full_message)
+                        await update.message.reply_text(
+                            plain_text,
+                            reply_markup=reply_markup,
                             disable_web_page_preview=True
                         )
+                else:
+                    parts = []
+                    current_part = ""
+                    for line in full_message.splitlines(True):
+                        if len(current_part) + len(line) > TELEGRAM_MAX_LENGTH:
+                            parts.append(current_part)
+                            current_part = line
+                        else:
+                            current_part += line
+                    parts.append(current_part)
 
-    except Exception as e:
-        # Этот блок ловит ошибки, возникшие внутри самого бота, а не в бэкенде
-        logger.error(f"Критическая ошибка в handle_creative для user {user.id}: {e}", exc_info=True)
-        user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В handle_creative: {e}", exc_info=True)
-        await update.message.reply_text("Приносим извинения, произошла внутренняя ошибка. Пожалуйста, попробуйте позже: для перезапуска бота введите команду /start")
-        if ADMIN_USER_ID:
-            await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id} (@{user.username})!\nОшибка: {e}")
-    finally:
-        context.user_data['is_processing'] = False
+                    for part in parts[:-1]:
+                        if part.strip():
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=update.effective_chat.id,
+                                    text=part,
+                                    parse_mode=ParseMode.HTML,
+                                    disable_web_page_preview=True
+                                )
+                            except Exception as html_err:
+                                logger.warning(f"HTML parse error in message part, sending without formatting: {html_err}")
+                                plain_part = re.sub(r'<[^>]+>', '', part)
+                                await context.bot.send_message(
+                                    chat_id=update.effective_chat.id,
+                                    text=plain_part,
+                                    disable_web_page_preview=True
+                                )
+
+                    if parts[-1].strip():
+                        try:
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text=parts[-1],
+                                reply_markup=reply_markup,
+                                parse_mode=ParseMode.HTML,
+                                disable_web_page_preview=True
+                            )
+                        except Exception as html_err:
+                            logger.warning(f"HTML parse error in last message part, sending without formatting: {html_err}")
+                            plain_last = re.sub(r'<[^>]+>', '', parts[-1])
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text=plain_last,
+                                reply_markup=reply_markup,
+                                disable_web_page_preview=True
+                            )
+
+        except Exception as e:
+            logger.error(f"Критическая ошибка в handle_creative для user {user.id}: {e}", exc_info=True)
+            user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В handle_creative: {e}", exc_info=True)
+            await update.message.reply_text("Приносим извинения, произошла внутренняя ошибка. Пожалуйста, попробуйте позже: для перезапуска бота введите команду /start")
+            if ADMIN_USER_ID:
+                await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id} (@{user.username})!\nОшибка: {e}")
 
 async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /unblock, доступный только администратору."""
@@ -846,6 +827,24 @@ async def handle_unexpected_text_in_feedback(update: Update, context: ContextTyp
 # БЛОК 6: ЗАПУСК БОТА
 # ===============================================================
 
+async def post_init(application: Application) -> None:
+    """Запускается после инициализации application: планировщик и уведомление админа."""
+    application.create_task(run_daily_scheduler())
+    if ADMIN_USER_ID:
+        await application.bot.send_message(ADMIN_USER_ID, "Бот успешно запущен/перезапущен!")
+
+
+def build_application() -> Application:
+    """Фабричная функция для сборки Application."""
+    return (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
+
+
 def main() -> None:
     """Основная функция запуска бота."""
     if not TELEGRAM_BOT_TOKEN:
@@ -854,9 +853,9 @@ def main() -> None:
 
     init_db()
     backend.initialize_backend(LOGS_DIR)
-    
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
+
+    application = build_application()
+
     feedback_conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(give_feedback, pattern='^give_feedback$')],
         states={            RATING: [
@@ -888,13 +887,6 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_creative))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_error_handler(error_handler)
-
-    loop = asyncio.get_event_loop()
-    # Запускаем  планировщик как фоновую задачу
-    loop.create_task(run_daily_scheduler())
-    
-    if ADMIN_USER_ID:
-        loop.run_until_complete(application.bot.send_message(ADMIN_USER_ID, "Бот успешно запущен/перезапущен!"))
 
     logger.info("Бот запущен и готов к работе.")
     application.run_polling()
