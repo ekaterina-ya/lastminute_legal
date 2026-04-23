@@ -461,7 +461,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 primary_error_message = analysis_result.get("message", "Неизвестная ошибка")
                 logger.error(f"Техническая ошибка (primary) для user {user.id}: {primary_error_message}")
                 if ADMIN_USER_ID:
-                    await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде (primary) у пользователя {user.id} (@{user.username})!\nОшибка: {primary_error_message}\n\nЗапускаю fallback-модель...")
+                    await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде (Gemini 3.1 Pro) у пользователя {user.id} (@{user.username})!\nОшибка: {primary_error_message}\n\nЗапускаю fallback (Gemini 2.5 Pro)...")
 
                 await update.message.reply_text(
                     "Приносим извинения, нейросеть Gemini 3.1 Pro не сработала из-за проблем на стороне Google. Мы подготовим заключение с нейросетью Gemini 2.5 Pro. Gemini 3.1 Pro скорее всего скоро починят, можете попробовать еще раз позднее."
@@ -516,7 +516,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                 model_used = analysis_result.get("model_used", "unknown")
                 if model_used == 'fallback' and ADMIN_USER_ID:
-                    await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} (@{user.username}) успешно подготовлено с помощью fallback-модели после сбоя основной.")
+                    await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} (@{user.username}) успешно подготовлено с помощью Gemini 2.5 Pro (fallback) после сбоя Gemini 3.1 Pro.")
 
                 final_output = analysis_result.get('final_output', "Произошла внутренняя ошибка.")
                 user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ ({model_used})]: {final_output}")
