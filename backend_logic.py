@@ -57,7 +57,10 @@ class GeminiClient:
     ]
     
     def __init__(self, api_key: str, primary_model: str, fallback_model: str, embedding_model: str):
-        self._client = genai.Client(api_key=api_key)
+        self._client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=180_000)  # 180 секунд в миллисекундах
+        )
         self._embedding_model_name = embedding_model
         self._primary_model_name = primary_model
         self._fallback_model_name = fallback_model

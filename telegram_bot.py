@@ -646,6 +646,19 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         await update.message.reply_text(f"Произошла ошибка при разблокировке: {e}")
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик необработанных исключений в хэндлерах."""
+    logger.error("Необработанное исключение при обработке апдейта", exc_info=context.error)
+    if ADMIN_USER_ID:
+        try:
+            await context.bot.send_message(
+                ADMIN_USER_ID,
+                f"⚠️ Необработанное исключение в боте:\n<code>{context.error}</code>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
 # ===============================================================
 # БЛОК 4: ПЛАНИРОВЩИК
 # ===============================================================
@@ -874,6 +887,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_creative))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_creative))
     application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_error_handler(error_handler)
 
     loop = asyncio.get_event_loop()
     # Запускаем  планировщик как фоновую задачу
