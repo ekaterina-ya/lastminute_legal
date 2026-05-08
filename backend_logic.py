@@ -221,10 +221,10 @@ def initialize_backend(logs_dir_path: str):
     print(f"Загрузка эмбеддингов из {CORPUS_EMBEDDINGS_PATH}")
     corpus_embeddings = np.load(CORPUS_EMBEDDINGS_PATH)
     
-    if 'docID' not in rag_df.columns or 'caseID' not in rag_df.columns:
-        raise ValueError("В RAG файле отсутствуют колонки 'docID' и/или 'caseID'.")
-        
-    doc_to_case_map = pd.Series(rag_df.caseID.values, index=rag_df.docID.astype(str)).to_dict()
+    if 'docId' not in rag_df.columns or 'caseID' not in rag_df.columns:
+        raise ValueError("В RAG файле отсутствуют колонки 'docId' и/или 'caseID'.")
+
+    doc_to_case_map = pd.Series(rag_df.caseID.values, index=rag_df.docId.astype(str)).to_dict()
 
 
 # ===============================================================
@@ -307,7 +307,7 @@ def format_rag_context(search_results_df):
         context_parts.append(
             f"Кейс (caseID: \"{row['caseID']}\"):\n"
             f"- Описание нарушения: \"{row.get('violation_summary', '')}\"\n"
-            f"- Аргументы ФАС: \"{row.get('fas_arguments', '')}\"\n"
+            f"- Аргументы ФАС: \"{row.get('FAS_arguments', '')}\"\n"
             f"- Теги: \"{row.get('thematic_tags', '')}\""
         )
     return "\n---\n".join(context_parts)
