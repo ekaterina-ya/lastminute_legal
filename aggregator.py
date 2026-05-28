@@ -46,6 +46,45 @@ file_handler.setFormatter(formatter)
 # Добавляем обработчик в логгер
 logger.addHandler(file_handler)
 
+# --- Цены на модели Gemini ---
+# (цена_за_1M_input, цена_за_1M_output) в USD, paid-tier.
+# Источник: https://ai.google.dev/gemini-api/docs/pricing (на 2026-05-28).
+# ВНИМАНИЕ: для 2.5-pro и 3.1-pro-preview цены удваиваются на запросах >200k токенов
+# (input: 1.25→2.50 и 2.00→4.00; output: 10→15 и 12→18). Здесь учитывается только
+# базовый тариф ≤200k. Если запросы перевалят за 200k — итог будет заниженным.
+MODEL_PRICES_USD_PER_M = {
+    "gemini-2.5-pro":             (1.25, 10.00),
+    "gemini-2.5-flash":           (0.30,  2.50),
+    "gemini-3.1-pro-preview":     (2.00, 12.00),
+    "gemini-3.1-pro":             (2.00, 12.00),  # на случай если модель переименуют — алиас
+    "gemini-3.5-flash":           (1.50,  9.00),
+    "gemini-3.1-flash-lite":      (0.25,  1.50),
+    "gemini-3-flash-preview":     (0.50,  3.00),
+}
+
+USAGE_LINE_RE = re.compile(
+    r"\[USAGE\] stage=(\S+) model=(\S+) input=(\d+) output=(\d+) cached=(\d+) ok=([01])"
+)
+
+
+def _estimate_cost_usd(model, input_tokens, output_tokens):
+    """Возвращает оценку стоимости в USD или None, если модели нет в прайсе."""
+    price = MODEL_PRICES_USD_PER_M.get(model)
+    if price is None:
+        return None
+    in_price, out_price = price
+    return (input_tokens / 1_000_000) * in_price + (output_tokens / 1_000_000) * out_price
+
+
+def _fmt_tokens(n):
+    """Форматирует число токенов: 12_345 -> '12.3k', 1_200_000 -> '1.20M'."""
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}k"
+    return str(int(n))
+
+
 # ===============================================================
 # БЛОК 2: ФУНКЦИИ ПАРСИНГА ОДНОГО ЗАПРОСА
 # ===============================================================
@@ -83,6 +122,10 @@ def parse_request_block(block_text, user_id, username):
         
         # Дополнительные технические данные
         'request_duration_sec': None,
+
+        # Структурированные события расхода токенов из [USAGE]-строк
+        # Список словарей: [{'stage', 'model', 'input', 'output', 'cached', 'ok'}, ...]
+        'usage_events': [],
     }
 
     # Извлекаем дату и время (берем первое вхождение)
@@ -124,15 +167,28 @@ def parse_request_block(block_text, user_id, username):
         search_results = re.findall(r'CaseID: ([\w-]+)', match_search.group(1))
         data['semantic_search_top10'] = ", ".join(search_results)
 
-    # Токены (суммируем все) - поддержка обоих форматов: с кавычками (JSON) и без
+    # Токены (суммируем все) - поддержка обоих форматов: с кавычками (JSON) и без.
+    # ОСТАВЛЕНО как контроль на время перехода — сверять с новым парсером [USAGE]-строк.
     token_counts = re.findall(r'"?total_token_count"?: (\d+)', block_text)
     data['total_tokens'] = sum(int(t) for t in token_counts)
-    
+
     # Токены по типам (input/output)
     prompt_counts = re.findall(r'"?prompt_token_count"?: (\d+)', block_text)
     data['prompt_tokens'] = sum(int(t) for t in prompt_counts)
     output_counts = re.findall(r'"?candidates_token_count"?: (\d+)', block_text)
     data['output_tokens'] = sum(int(t) for t in output_counts)
+
+    # Новый источник истины: [USAGE]-строки с разбивкой по стадиям и моделям.
+    for m in USAGE_LINE_RE.finditer(block_text):
+        stage, model, in_t, out_t, cached_t, ok = m.groups()
+        data['usage_events'].append({
+            'stage': stage,
+            'model': model,
+            'input': int(in_t),
+            'output': int(out_t),
+            'cached': int(cached_t),
+            'ok': ok == '1',
+        })
 
     # Обратная связь
     match_feedback = re.search(r'--- ОБРАТНАЯ СВЯЗЬ ---\n(\{.*?\})', block_text, re.DOTALL)
@@ -267,13 +323,25 @@ def generate_summary_report(df, db_path):
     # 4. Запросов сегодня
     daily_requests = len(df_today)
 
-    # 5. Потрачено токенов
+    # 5a. Контрольный подсчёт по старому JSON-парсеру (на время перехода)
     daily_total_tokens = int(df_today['total_tokens'].sum())
     daily_prompt_tokens = int(df_today['prompt_tokens'].sum())
     daily_output_tokens = int(df_today['output_tokens'].sum())
 
-    # 6. Среднее кол-во токенов на запрос
-    avg_tokens_per_request = daily_total_tokens / daily_requests if daily_requests > 0 else 0
+    # 5b. Разбивка по (стадия, модель) из [USAGE]-строк
+    # Учитываем только успешные вызовы (ok=True).
+    stage_model_breakdown = {}  # {(stage, model): {'input', 'output', 'cached'}}
+    for events in df_today['usage_events']:
+        if not isinstance(events, list):
+            continue
+        for ev in events:
+            if not ev.get('ok'):
+                continue
+            key = (ev['stage'], ev['model'])
+            agg = stage_model_breakdown.setdefault(key, {'input': 0, 'output': 0, 'cached': 0})
+            agg['input'] += ev['input']
+            agg['output'] += ev['output']
+            agg['cached'] += ev['cached']
 
     # 7. Заполнили опросник
     feedback_users = df_today[df_today['полезность'].notna()]['telegram_id'].nunique()
@@ -292,6 +360,37 @@ def generate_summary_report(df, db_path):
     # Пока что это просто заглушка.
     # TODO: Добавить парсинг 'security.log' для точного определения блокировок.
 
+    # --- Сборка блока «API и Расходы» ---
+    api_lines = []
+    total_cost_usd = 0.0
+    any_unknown_price = False
+    if stage_model_breakdown:
+        for (stage, model), agg in sorted(stage_model_breakdown.items()):
+            cost = _estimate_cost_usd(model, agg['input'], agg['output'])
+            if cost is None:
+                any_unknown_price = True
+                cost_str = "цена ?"
+            else:
+                total_cost_usd += cost
+                cost_str = f"≈ ${cost:.2f}"
+            api_lines.append(
+                f"• {stage} ({model}): in *{_fmt_tokens(agg['input'])}* / "
+                f"out *{_fmt_tokens(agg['output'])}*  {cost_str}"
+            )
+        suffix = " (часть моделей без цены)" if any_unknown_price else ""
+        api_lines.append(f"• Итого ≈ *${total_cost_usd:.2f}*{suffix}")
+    else:
+        # Фолбэк: нет ни одной [USAGE]-строки (старые логи)
+        api_lines.append(f"• Потрачено токенов: *{daily_total_tokens:,}*")
+        api_lines.append(f"  ↳ input: *{daily_prompt_tokens:,}* / output: *{daily_output_tokens:,}*")
+
+    # Контроль на время перехода — суммарно по старому JSON-парсеру
+    api_lines.append(
+        f"_(контроль по JSON: total {daily_total_tokens:,}, "
+        f"in {daily_prompt_tokens:,}, out {daily_output_tokens:,})_"
+    )
+    api_block = "\n".join(api_lines)
+
     report = f"""
 *Ежедневный отчет по боту за {today.strftime('%d.%m.%Y')}*
 
@@ -302,9 +401,7 @@ def generate_summary_report(df, db_path):
 • Всего запросов сегодня: *{daily_requests}*
 
 🤖 *API и Расходы:*
-• Потрачено токенов: *{daily_total_tokens:,}*
-  ↳ input: *{daily_prompt_tokens:,}* / output: *{daily_output_tokens:,}*
-• В среднем на запрос: *{int(avg_tokens_per_request)}* токенов
+{api_block}
 
 📝 *Обратная связь:*
 • Заполнили опросник: *{feedback_users}* чел.

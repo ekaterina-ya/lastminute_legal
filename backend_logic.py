@@ -40,6 +40,26 @@ def load_prompt_from_file(file_path):
         raise ValueError(f"КРИТИЧЕСКАЯ ОШИБКА: Файл с промптом не найден по пути '{file_path}'.")
 
 
+def _format_usage_line(stage, model, input_tokens, output_tokens, cached_tokens, ok):
+    return (
+        f"[USAGE] stage={stage} model={model} "
+        f"input={int(input_tokens)} output={int(output_tokens)} cached={int(cached_tokens)} "
+        f"ok={int(bool(ok))}"
+    )
+
+
+def _extract_usage(response):
+    """Возвращает (input, output, cached) из usage_metadata. Нули, если поля нет."""
+    usage = getattr(response, 'usage_metadata', None)
+    if usage is None:
+        return 0, 0, 0
+    return (
+        getattr(usage, 'prompt_token_count', 0) or 0,
+        getattr(usage, 'candidates_token_count', 0) or 0,
+        getattr(usage, 'cached_content_token_count', 0) or 0,
+    )
+
+
 # ===============================================================
 # БЛОК 2: GEMINI CLIENT (обёртка над API)
 # ===============================================================
@@ -66,7 +86,7 @@ class GeminiClient:
         self._primary_model_name = primary_model
         self._fallback_model_name = fallback_model
     
-    async def generate(self, content: list, use_fallback: bool = False, user_logger: logging.Logger = None) -> dict:
+    async def generate(self, content: list, use_fallback: bool = False, user_logger: logging.Logger = None, stage: str = None) -> dict:
         """
         Генерация ответа от LLM с парсингом.
         Returns: dict: {status, text/message, model}
@@ -79,19 +99,27 @@ class GeminiClient:
                 contents=content,
                 config=types.GenerateContentConfig(safety_settings=self.SAFETY_SETTINGS)
             )
-            
+
+            input_tokens, output_tokens, cached_tokens = _extract_usage(response)
+            got_usage = getattr(response, 'usage_metadata', None) is not None
+            if user_logger:
+                user_logger.info(_format_usage_line(
+                    stage, model_name, input_tokens, output_tokens, cached_tokens, ok=got_usage
+                ))
+
             status, result_text = self._parse_response(response, model_name, user_logger)
-            
+
             if status == 'SUCCESS':
                 return {"status": "SUCCESS", "text": result_text, "model": model_name}
             elif status == 'SAFETY':
                 return {"status": "SAFETY", "message": result_text, "model": model_name}
             else:
                 return {"status": "ERROR", "message": result_text, "model": model_name}
-                
+
         except Exception as e:
             error_msg = f"Исключение при вызове API ({model_name}): {str(e)}"
             if user_logger:
+                user_logger.info(_format_usage_line(stage, model_name, 0, 0, 0, ok=False))
                 user_logger.error(error_msg)
             return {"status": "ERROR", "message": error_msg, "model": model_name}
     
@@ -479,7 +507,7 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         # 1. Предварительная обработка контента через GeminiClient
         print("Шаг 1: Предварительная обработка контента...")
         content_for_preprocessing = [PROMPT_1_PREPROCESSING] + user_content_for_api
-        preprocess_result = await gemini_client.generate(content_for_preprocessing, use_fallback=use_fallback, user_logger=user_logger)
+        preprocess_result = await gemini_client.generate(content_for_preprocessing, use_fallback=use_fallback, user_logger=user_logger, stage="preprocess")
         
         if preprocess_result["status"] == "SAFETY":
             # DIAG-START
@@ -501,7 +529,7 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         print("Шаг 3: Генерация финального юридического заключения...")
         final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
         final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
-        final_result = await gemini_client.generate([final_prompt], use_fallback=use_fallback, user_logger=user_logger)
+        final_result = await gemini_client.generate([final_prompt], use_fallback=use_fallback, user_logger=user_logger, stage="final")
         
         if final_result["status"] == "SAFETY":
             # DIAG-START
