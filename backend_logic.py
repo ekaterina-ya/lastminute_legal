@@ -452,6 +452,50 @@ def postprocess_final_answer(final_text):
 
 
 # ===============================================================
+# БЛОК 5.1: ДОСТУП К ТЕКСТАМ РЕШЕНИЙ (для кнопки "узнать подробнее")
+# ===============================================================
+CASE_ID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+
+def extract_cited_case_ids(text: str) -> list:
+    """Упорядоченный список уникальных caseID, процитированных в заключении."""
+    seen = []
+    for raw in CASE_ID_PATTERN.findall(text or ""):
+        cid = raw.lower()
+        if cid not in seen:
+            seen.append(cid)
+    return seen
+
+
+def get_case_details(case_id: str):
+    """Возвращает данные кейса по caseID из загруженного rag_df (или None)."""
+    if rag_df is None or not case_id:
+        return None
+    mask = rag_df['caseID'].astype(str).str.lower() == case_id.lower()
+    rows = rag_df[mask]
+    if rows.empty:
+        return None
+    row = rows.iloc[0]
+
+    def _val(x):
+        return '' if pd.isna(x) else str(x).strip()
+
+    link = _val(row.get('FASbd_link')) or f"https://br.fas.gov.ru/cases/{case_id}/"
+    return {
+        'case_id': case_id,
+        'date': _val(row.get('document_date')),
+        'defendant': _val(row.get('defendant_name')),
+        'industry': _val(row.get('defendant_industry')),
+        'tags': _val(row.get('thematic_tags')),
+        'arguments': _val(row.get('FAS_arguments')),
+        'link': link,
+    }
+
+
+# ===============================================================
 # БЛОК 6: ГЛАВНАЯ ФУНКЦИЯ (ТОЧКА ВХОДА ДЛЯ БОТА)
 # ===============================================================
 async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None, original_filename=None, user_id: int = None, user_logger: logging.Logger = None, model_to_use: str = 'primary') -> dict:
@@ -542,7 +586,8 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
             raise Exception(f"Ошибка финального анализа: {final_result['message']}")
         
         final_text = final_result["text"]
-        
+        cited_case_ids = extract_cited_case_ids(final_text)
+
         # 4. Пост-обработка
         final_output = postprocess_final_answer(final_text)
         
@@ -554,7 +599,8 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         return {
             "final_output": final_output,
             "preprocessed_text": processed_text,
-            "model_used": model_to_use
+            "model_used": model_to_use,
+            "cited_case_ids": cited_case_ids
         }
         
     except Exception as e:

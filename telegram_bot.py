@@ -241,6 +241,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await learn_more(query, context)
     elif query.data == "check_another":
         await check_another(query, context)
+    elif query.data.startswith("show_cases"):
+        try:
+            session_idx = int(query.data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            return
+        await show_cases(query, context, session_idx)
+    elif query.data.startswith("case_"):
+        parts = query.data.split("_")
+        try:
+            session_idx, idx = int(parts[1]), int(parts[2])
+        except (ValueError, IndexError):
+            return
+        await show_case_detail(query, context, session_idx, idx)
 
 async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Пользователь согласился, просим загрузить креатив."""
@@ -353,6 +366,68 @@ async def check_another(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.message.reply_text(text=upload_text, parse_mode=ParseMode.HTML)
     await query.answer()
 
+
+# --- Функционал "узнать подробнее о решении" ---
+
+def _get_session_cases(context: ContextTypes.DEFAULT_TYPE, session_idx: int) -> list:
+    """Список caseID, процитированных в конкретном заключении (по его session-индексу)."""
+    return (context.user_data.get('case_sessions', {}) or {}).get(session_idx, [])
+
+
+def _format_case_text(details: dict) -> str:
+    """Карточка решения: дата, ссылка, аргументы ФАС."""
+    import html
+    date = html.escape(details.get('date') or '—')
+    link = details.get('link', '')
+    arguments = html.escape(details.get('arguments') or 'Текст аргументов недоступен.')
+    header = (
+        f"<b>Решение ФАС</b>\n"
+        f"<b>Дата:</b> {date}\n"
+        f"<b>Ссылка:</b> <a href=\"{link}\">{link}</a>"
+    )
+    text = f"{header}\n\n{arguments}"
+    if len(text) > 4000:
+        text = text[:3990] + "…"
+    return text
+
+
+async def show_cases(query, context: ContextTypes.DEFAULT_TYPE, session_idx: int) -> None:
+    """Показывает клавиатуру со списком процитированных в заключении решений."""
+    cited = _get_session_cases(context, session_idx)
+    if not cited:
+        await query.message.reply_text("Решения для этого заключения недоступны (возможно, бот перезапускался).")
+        return
+    keyboard = [
+        [InlineKeyboardButton(f"Решение по ссылке {i + 1}", callback_data=f"case_{session_idx}_{i}")]
+        for i in range(len(cited))
+    ]
+    keyboard.append([InlineKeyboardButton("✅ Проверить следующий креатив", callback_data="check_another")])
+    await query.message.reply_text(
+        "Выберите решение, чтобы посмотреть подробнее:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def show_case_detail(query, context: ContextTypes.DEFAULT_TYPE, session_idx: int, idx: int) -> None:
+    """Отправляет текст выбранного решения и клавиатуру для продолжения."""
+    cited = _get_session_cases(context, session_idx)
+    if idx < 0 or idx >= len(cited):
+        await query.message.reply_text("Решение не найдено, попробуйте заново.")
+        return
+    details = backend.get_case_details(cited[idx])
+    if not details:
+        await query.message.reply_text("Не удалось найти текст этого решения.")
+        return
+    keyboard = [
+        [InlineKeyboardButton("🔎 Посмотреть другое решение", callback_data=f"show_cases:{session_idx}")],
+        [InlineKeyboardButton("✅ Проверить следующий креатив", callback_data="check_another")],
+    ]
+    await query.message.reply_text(
+        _format_case_text(details),
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True
+    )
 
 
 async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -519,15 +594,23 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} (@{user.username}) успешно подготовлено с помощью Gemini 2.5 Pro (fallback) после сбоя Gemini 3.1 Pro.")
 
                 final_output = analysis_result.get('final_output', "Произошла внутренняя ошибка.")
+                cited_cases = analysis_result.get('cited_case_ids', []) or []
                 user_logger.info(f"[ФИНАЛЬНЫЙ ОТВЕТ ({model_used})]: {final_output}")
                 full_message = final_output
 
-                keyboard = [
+                keyboard = []
+                if cited_cases:
+                    sessions = context.user_data.setdefault('case_sessions', {})
+                    session_idx = context.user_data.get('case_session_counter', 0) + 1
+                    context.user_data['case_session_counter'] = session_idx
+                    sessions[session_idx] = cited_cases
+                    keyboard.append([InlineKeyboardButton("⚖️ Узнать больше об упомянутых решениях ФАС", callback_data=f"show_cases:{session_idx}")])
+                keyboard.extend([
                     [InlineKeyboardButton("✅ Проверить еще один креатив", callback_data="check_another")],
                     [InlineKeyboardButton("✍️ Дать обратную связь", callback_data="give_feedback")],
                     [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
                     [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
-                ]
+                ])
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
                 TELEGRAM_MAX_LENGTH = 4000
