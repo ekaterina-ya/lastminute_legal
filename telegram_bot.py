@@ -10,7 +10,7 @@ import re
 from datetime import datetime, time, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ConversationHandler,
+    Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
 from telegram.constants import ParseMode
@@ -66,9 +66,6 @@ TOTAL_BLOCK_LIMIT = 15
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 MAX_FILE_SIZE_MB = 20
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
-
-# --- Состояния для ConversationHandler (опрос обратной связи) ---
-(RATING, USAGE, PROFILE, ELABORATE, FEEDBACK_TEXT) = range(5)
 
 # ===============================================================
 # БЛОК 2: РАБОТА С БАЗОЙ ДАННЫХ (ЛИМИТЫ И БЛОКИРОВКИ)
@@ -607,7 +604,6 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     keyboard.append([InlineKeyboardButton("⚖️ Узнать больше об упомянутых решениях ФАС", callback_data=f"show_cases:{session_idx}")])
                 keyboard.extend([
                     [InlineKeyboardButton("✅ Проверить еще один креатив", callback_data="check_another")],
-                    [InlineKeyboardButton("✍️ Дать обратную связь", callback_data="give_feedback")],
                     [InlineKeyboardButton("🔍 Попробуйте поиск по практике ФАС", url="https://search.delay-rag.ru")],
                     [InlineKeyboardButton("👩🏻‍💻 Узнать больше о проекте", url=CHANNEL_URL)]
                 ])
@@ -761,152 +757,6 @@ async def run_daily_scheduler():
             await asyncio.sleep(300)
 
 # ===============================================================
-# БЛОК 5: ЛОГИКА ОБРАТНОЙ СВЯЗИ (CONVERSATION HANDLER)
-# ===============================================================
-async def give_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """
-    Начинает опрос обратной связи, отправляя вопросы в новом сообщении.
-    У исходного сообщения с заключением убираются кнопки.
-    """
-    query = update.callback_query
-    await query.answer()
-
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except Exception as e:
-        logger.warning(f"Не удалось убрать клавиатуру у сообщения с заключением: {e}")
-
-    context.user_data['awaiting_creative'] = False
-
-    text = "Спасибо за вашу готовность помочь! Ваша обратная связь поможет развитию проекта.\n\n<b>Вопрос 1/4:</b> Оцените, насколько вы согласны с оценкой рисков, предложенной ботом?"
-    keyboard = [[
-        InlineKeyboardButton("1", callback_data="rate_1"),
-        InlineKeyboardButton("2", callback_data="rate_2"),
-        InlineKeyboardButton("3", callback_data="rate_3"),
-        InlineKeyboardButton("4", callback_data="rate_4"),
-        InlineKeyboardButton("5", callback_data="rate_5"),
-    ]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.message.reply_text(
-        text=text, 
-        reply_markup=reply_markup, 
-        parse_mode=ParseMode.HTML
-    )
-    
-    return RATING
-
-
-async def rating_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Шаг 2: оценка."""
-    query = update.callback_query
-    await query.answer()
-    context.user_data['feedback_rating'] = query.data
-
-    text = "<b>Вопрос 2/4:</b> Вы воспользуетесь рекомендациями бота?"
-    keyboard = [
-        [InlineKeyboardButton("Да", callback_data="usage_yes")],
-        [InlineKeyboardButton("Нет", callback_data="usage_no")],
-        [InlineKeyboardButton("Частично", callback_data="usage_partial")],
-        [InlineKeyboardButton("Бот не предлагал исправлений", callback_data="usage_no_recs")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text=text, reply_markup=reply_markup, 
-        parse_mode=ParseMode.HTML)
-    return USAGE
-
-async def usage_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Шаг 3: профиль."""
-    query = update.callback_query
-    await query.answer()
-    context.user_data['feedback_usage'] = query.data
-
-    text = "<b>Вопрос 3/4:</b> Расскажите немного о себе. Вы..."
-    keyboard = [
-        [InlineKeyboardButton("из креативной индустрии", callback_data="profile_creative")],
-        [InlineKeyboardButton("юрист", callback_data="profile_lawyer")],
-        [InlineKeyboardButton("ИИ-энтузиаст", callback_data="profile_ai")],
-        [InlineKeyboardButton("неравнодушный гражданин", callback_data="profile_citizen")],
-        [InlineKeyboardButton("иное", callback_data="profile_other")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text=text, reply_markup=reply_markup, 
-        parse_mode=ParseMode.HTML)
-    return PROFILE
-
-async def profile_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Шаг 4: желание помочь."""
-    query = update.callback_query
-    await query.answer()
-    context.user_data['feedback_profile'] = query.data
-
-    text = "<b>Вопрос 4/4:</b> Я хочу помочь развитию проекта и подробнее рассказать, в чем я согласен или не согласен с ответом бота."
-    keyboard = [
-        [InlineKeyboardButton("Да, хочу рассказать", callback_data="elaborate_yes")],
-        [InlineKeyboardButton("Нет", callback_data="elaborate_no")],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(text=text, reply_markup=reply_markup, 
-        parse_mode=ParseMode.HTML)
-    return ELABORATE
-
-async def elaborate_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Шаг 5: обработка желания помочь."""
-    query = update.callback_query
-    await query.answer()
-    
-    if query.data == "elaborate_yes":
-        await query.edit_message_text("Спасибо! Поделитесь вашей оценкой заключения бота, это поможет нам с улучшением качества ответов. Просто отправьте текст следующим сообщением.")
-        return FEEDBACK_TEXT
-    else:
-        await query.edit_message_text("Спасибо за ваши ответы! Они помогут боту стать лучше.")
-        await post_feedback_menu(query.message, context)
-        return ConversationHandler.END
-
-async def feedback_text_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получает текстовую обратную связь."""
-    context.user_data['feedback_text'] = update.message.text
-    await update.message.reply_text("Ваш подробный отзыв сохранен. Огромное спасибо за помощь!")
-    await post_feedback_menu(update.message, context)
-    return ConversationHandler.END
-    
-async def post_feedback_menu(message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показывает меню после завершения опроса и логирует результат."""
-    user = message.chat
-    user_logger = setup_user_logger(user.id)
-    
-    feedback_data = {
-        'rating': context.user_data.get('feedback_rating'),
-        'usage': context.user_data.get('feedback_usage'),
-        'profile': context.user_data.get('feedback_profile'),
-        'text': context.user_data.get('feedback_text', 'N/A')
-    }
-    user_logger.info(f"--- ОБРАТНАЯ СВЯЗЬ ---\n{feedback_data}")
-
-    context.user_data.clear()
-
-    keyboard = [
-        [InlineKeyboardButton("✅ Проверить креатив", callback_data="check_another")],
-        [InlineKeyboardButton("ℹ️ Узнать об ограничениях", callback_data="learn_more")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await message.reply_text("Что вы хотите сделать дальше?", reply_markup=reply_markup)
-
-async def cancel_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отменяет опрос."""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Опрос отменен.")
-    await post_feedback_menu(query.message, context)
-    return ConversationHandler.END
-
-async def handle_unexpected_text_in_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Сообщает пользователю, что нужно использовать кнопки во время опроса."""
-    await update.message.reply_text(
-        "Пожалуйста, используйте кнопки для ответа на вопрос. "
-        "Если вы хотите прервать опрос и вернуться в главное меню, отправьте команду /start."
-    )
-# ===============================================================
 # БЛОК 6: ЗАПУСК БОТА
 # ===============================================================
 
@@ -939,33 +789,9 @@ def main() -> None:
 
     application = build_application()
 
-    feedback_conv_handler = ConversationHandler(
-        entry_points=[CallbackQueryHandler(give_feedback, pattern='^give_feedback$')],
-        states={            RATING: [
-                CallbackQueryHandler(rating_step, pattern='^rate_'),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unexpected_text_in_feedback)
-            ],
-            USAGE: [
-                CallbackQueryHandler(usage_step, pattern='^usage_'),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unexpected_text_in_feedback)
-            ],
-            PROFILE: [
-                CallbackQueryHandler(profile_step, pattern='^profile_'),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unexpected_text_in_feedback)
-            ],
-            ELABORATE: [
-                CallbackQueryHandler(elaborate_step, pattern='^elaborate_'),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unexpected_text_in_feedback)
-            ],
-            FEEDBACK_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_text_step)],
-        },
-        fallbacks=[CommandHandler('start', cancel_feedback)],
-        per_user=True 
-    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("unblock", unblock_command))
-    application.add_handler(feedback_conv_handler)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_creative))
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_creative))
     application.add_handler(CallbackQueryHandler(button_handler))
