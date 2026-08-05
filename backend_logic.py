@@ -12,8 +12,13 @@ import io
 import logging
 import json
 import asyncio
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'legal'))
+from legal_loader import LegalCorpus, normalize_article  # noqa: E402
 
 # --- Глобальные переменные для кеширования ---
+LEGAL = None  # корпус закона и руководств ФАС (подгружается по статьям)
 rag_df = None
 corpus_embeddings = None
 doc_to_case_map = None
@@ -204,7 +209,7 @@ def initialize_backend(logs_dir_path: str):
     """
     global rag_df, corpus_embeddings, doc_to_case_map, gemini_client
     global PROMPT_1_PREPROCESSING, PROMPT_2_ANALYSIS, RAG_TOP_N
-    global USER_FILES_DIR, FILE_COUNTER_PATH
+    global USER_FILES_DIR, FILE_COUNTER_PATH, LEGAL
 
     print("Инициализация бэкенда...")
     
@@ -253,6 +258,17 @@ def initialize_backend(logs_dir_path: str):
         raise ValueError("В RAG файле отсутствуют колонки 'docId' и/или 'caseID'.")
 
     doc_to_case_map = pd.Series(rag_df.caseID.values, index=rag_df.docId.astype(str)).to_dict()
+
+    # --- Загрузка правового корпуса ---
+    legal_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'legal')
+    LEGAL = LegalCorpus(os.path.join(legal_dir, 'zakon.md'), os.path.join(legal_dir, 'rukovodstva.md'))
+
+    # Роутер выбирает статьи из готового списка, а не вспоминает их по памяти:
+    # иначе он не знает о статьях, появившихся после knowledge cutoff модели.
+    menu = "\n".join(LEGAL.law_sections[k].splitlines()[0].replace('### ', '') for k in LEGAL.law_order)
+    PROMPT_1_PREPROCESSING = PROMPT_1_PREPROCESSING.replace("{{articles_menu}}", menu)
+    print(f"[LEGAL] статей в законе: {len(LEGAL.law_sections)}, в руководствах: {len(LEGAL.guide_sections)}, "
+          f"меню роутера: {len(menu)} симв.")
 
 
 # ===============================================================
@@ -339,6 +355,31 @@ def format_rag_context(search_results_df):
             f"- Теги: \"{row.get('thematic_tags', '')}\""
         )
     return "\n---\n".join(context_parts)
+
+# --- Роутинг: подбор применимых статей закона ---
+ARTICLES_LINE_RE = re.compile(r"^\s*СТАТЬИ:\s*(.+)$", re.M)
+
+def split_articles_line(raw_text: str):
+    """Отделяет служебную строку «СТАТЬИ: ...» от описания креатива."""
+    m = ARTICLES_LINE_RE.search(raw_text)
+    if not m:
+        return raw_text.strip(), []
+    articles = [a for a in (normalize_article(x) for x in m.group(1).split(',')) if a]
+    return ARTICLES_LINE_RE.sub('', raw_text).strip(), articles
+
+def articles_from_rag(search_results_df) -> list:
+    """Статьи, по которым квалифицированы найденные RAG-кейсы."""
+    if search_results_df.empty or 'legal_provisions' not in search_results_df.columns:
+        return []
+    articles = []
+    for raw in search_results_df['legal_provisions'].dropna():
+        articles += [a for a in (normalize_article(x) for x in str(raw).split(',')) if a]
+    return articles
+
+def order_articles(articles: list) -> list:
+    """Уникальные статьи в порядке их следования в законе."""
+    uniq = set(articles)
+    return [k for k in LEGAL.law_order if k in uniq]
 
 def sanitize_html(text: str) -> str:
     """
@@ -563,16 +604,27 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         if preprocess_result["status"] == "ERROR":
             raise Exception(f"Ошибка предобработки: {preprocess_result['message']}")
         
-        processed_text = preprocess_result["text"]
+        processed_text, articles_pre = split_articles_line(preprocess_result["text"])
 
         # 2. Поиск в RAG
         rag_results = await semantic_search(processed_text, user_logger=user_logger)
         rag_context = format_rag_context(rag_results)
+
+        # 2.1. Роутинг: какие статьи подгружаем в промпт
+        articles_rag = articles_from_rag(rag_results)
+        articles = order_articles(articles_pre + articles_rag)
+        route_log = (f"[LEGAL] препроцессинг: {articles_pre or '—'} | RAG: {sorted(set(articles_rag)) or '—'} "
+                     f"| итого: {articles or '—'}")
+        print(route_log, flush=True)
+        if user_logger:
+            user_logger.info(route_log)
         
         # 3. Финальный анализ через GeminiClient
         print("Шаг 3: Генерация финального юридического заключения...")
         final_prompt = PROMPT_2_ANALYSIS.replace("{{user_creative_text}}", processed_text)
         final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
+        final_prompt = final_prompt.replace("{{law_text}}", LEGAL.law_for(articles) or "(статьи не определены)")
+        final_prompt = final_prompt.replace("{{guidelines_text}}", LEGAL.guidelines_for(articles) or "(нет применимых руководств)")
         final_result = await gemini_client.generate([final_prompt], use_fallback=use_fallback, user_logger=user_logger, stage="final")
         
         if final_result["status"] == "SAFETY":
