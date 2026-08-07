@@ -410,7 +410,10 @@ async def show_cases(query, context: ContextTypes.DEFAULT_TYPE, session_idx: int
     """Показывает клавиатуру со списком процитированных в заключении решений."""
     cited = _get_session_cases(context, session_idx)
     if not cited:
-        await query.message.reply_text("Решения для этого заключения недоступны (возможно, бот перезапускался).")
+        await query.message.reply_text(
+            "Решения для этого заключения недоступны (возможно, бот перезапускался).",
+            reply_markup=dead_end_keyboard()
+        )
         return
     keyboard = [
         [InlineKeyboardButton(f"Решение по ссылке {i + 1}", callback_data=f"case_{session_idx}_{i}")]
@@ -427,11 +430,17 @@ async def show_case_detail(query, context: ContextTypes.DEFAULT_TYPE, session_id
     """Отправляет текст выбранного решения и клавиатуру для продолжения."""
     cited = _get_session_cases(context, session_idx)
     if idx < 0 or idx >= len(cited):
-        await query.message.reply_text("Решение не найдено, попробуйте заново.")
+        await query.message.reply_text(
+            "Решение не найдено, попробуйте заново.",
+            reply_markup=dead_end_keyboard()
+        )
         return
     details = backend.get_case_details(cited[idx])
     if not details:
-        await query.message.reply_text("Не удалось найти текст этого решения.")
+        await query.message.reply_text(
+            "Не удалось найти текст этого решения.",
+            reply_markup=dead_end_keyboard()
+        )
         return
     keyboard = [
         [InlineKeyboardButton("🔎 Посмотреть другое решение", callback_data=f"show_cases:{session_idx}")],
@@ -699,7 +708,10 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception as e:
             logger.error(f"Критическая ошибка в handle_creative для user {user.id}: {e}", exc_info=True)
             user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В handle_creative: {e}", exc_info=True)
-            await update.message.reply_text("Приносим извинения, произошла внутренняя ошибка. Пожалуйста, попробуйте позже: для перезапуска бота введите команду /start")
+            await update.message.reply_text(
+                "Приносим извинения, произошла внутренняя ошибка. Пожалуйста, попробуйте позже.",
+                reply_markup=dead_end_keyboard()
+            )
             if ADMIN_USER_ID:
                 await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id} (@{user.username})!\nОшибка: {e}")
 
