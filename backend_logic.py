@@ -348,8 +348,11 @@ def format_rag_context(search_results_df):
     
     context_parts = []
     for _, row in search_results_df.iterrows():
+        date = row.get('document_date', '')
+        date = 'не указана' if pd.isna(date) else str(date).strip()
         context_parts.append(
             f"Кейс (caseID: \"{row['caseID']}\"):\n"
+            f"- Дата решения: \"{date}\"\n"
             f"- Описание нарушения: \"{row.get('violation_summary', '')}\"\n"
             f"- Аргументы ФАС: \"{row.get('FAS_arguments', '')}\"\n"
             f"- Теги: \"{row.get('thematic_tags', '')}\""

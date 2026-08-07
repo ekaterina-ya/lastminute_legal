@@ -226,7 +226,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик нажатий на основные inline-кнопки."""
     query = update.callback_query
-    if query.data in ("agree_and_upload", "check_another"):
+    if query.data in ("agree_and_upload", "agree_and_upload_keep", "check_another"):
         lock = context.user_data.get("analysis_lock")
         if lock and lock.locked():
             await query.answer("Идёт анализ, дождитесь результата", show_alert=False)
@@ -234,6 +234,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     if query.data == "agree_and_upload":
         await agree_and_upload(query, context)
+    elif query.data == "agree_and_upload_keep":
+        await agree_and_upload(query, context, replace_message=False)
     elif query.data == "learn_more":
         await learn_more(query, context)
     elif query.data == "check_another":
@@ -252,13 +254,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         await show_case_detail(query, context, session_idx, idx)
 
-async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Пользователь согласился, просим загрузить креатив."""
+LIMIT_TEXT = "Лимит на сегодня исчерпан. Спасибо за доверие, буду рад помочь завтра!"
+
+def dead_end_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура для сообщений, из которых иначе некуда нажать: лимит, потерянный флаг ожидания."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("ℹ️ Больше об ограничениях", callback_data="learn_more")],
+        [InlineKeyboardButton("✅ Проверить креатив", callback_data="check_another")],
+    ])
+
+async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE, replace_message: bool = True) -> None:
+    """Пользователь согласился, просим загрузить креатив.
+
+    replace_message=False — не затирать сообщение с кнопкой (пост об ограничениях), а прислать новое.
+    """
     user_id = query.from_user.id
     if is_user_blocked(user_id): return
     remaining = get_remaining_requests(user_id)
     if remaining <= 0:
-        await query.message.reply_text("Лимит на сегодня исчерпан. Спасибо за доверие, буду рад помочь завтра!")
+        await query.message.reply_text(LIMIT_TEXT, reply_markup=dead_end_keyboard())
         return
 
     context.user_data['awaiting_creative'] = True
@@ -275,7 +289,11 @@ async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 Если вас интересует подбор релевантной практики ФАС под ваши креативы или возникающие в работе вопросы, то вы также можете воспользоваться <b><a href="https://search.delay-rag.ru">сервисом</a></b>, предназначенным специально для удобного поиска по решениям ФАС.
         """
     )
-    await query.edit_message_text(text=upload_text, parse_mode=ParseMode.HTML)
+    if replace_message:
+        await query.edit_message_text(text=upload_text, parse_mode=ParseMode.HTML)
+    else:
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(text=upload_text, parse_mode=ParseMode.HTML)
 
 async def learn_more(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = query.from_user
@@ -331,7 +349,7 @@ async def learn_more(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 И присоединяйтесь к <a href="https://t.me/delay_RAG">каналу</a> автора бота! В нем много о RAG-технологии, вайб-кодинге и продвинутом использовании нейросетей в работе юриста."""
     )
 
-    keyboard = [[InlineKeyboardButton("✅ Понятно, хочу загрузить креатив", callback_data="agree_and_upload")]]
+    keyboard = [[InlineKeyboardButton("✅ Понятно, хочу загрузить креатив", callback_data="agree_and_upload_keep")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await query.edit_message_text(
@@ -353,7 +371,7 @@ async def check_another(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     remaining = get_remaining_requests(user_id)
     
     if remaining <= 0:
-        await query.message.reply_text("Лимит на сегодня исчерпан. Спасибо за доверие, буду рад помочь завтра!")
+        await query.message.reply_text(LIMIT_TEXT, reply_markup=dead_end_keyboard())
         return
 
     context.user_data['awaiting_creative'] = True
@@ -440,12 +458,15 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not context.user_data.get('awaiting_creative', False):
         user_logger.warning("Попытка отправить креатив без получения разрешения (из главного меню).")
-        await update.message.reply_text("Пожалуйста, нажмите на одну из кнопок, чтобы продолжить.")
+        await update.message.reply_text(
+            "Пожалуйста, нажмите на одну из кнопок, чтобы продолжить.",
+            reply_markup=dead_end_keyboard()
+        )
         return
 
     # Предварительная проверка лимита, без списания
     if get_remaining_requests(user.id) <= 0:
-        await update.message.reply_text("Лимит на сегодня исчерпан. Спасибо за доверие, буду рад помочь завтра!")
+        await update.message.reply_text(LIMIT_TEXT, reply_markup=dead_end_keyboard())
         user_logger.warning("Попытка запроса при исчерпанном лимите.")
         return
 
