@@ -14,6 +14,8 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 from telegram.constants import ParseMode
+import telegram.error
+import httpx
 import backend_logic as backend
 import aggregator
 from pypdf import PdfReader
@@ -256,11 +258,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 LIMIT_TEXT = "Лимит на сегодня исчерпан. Спасибо за доверие, буду рад помочь завтра!"
 
-def dead_end_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура для сообщений, из которых иначе некуда нажать: лимит, потерянный флаг ожидания."""
+INTERNAL_ERROR_TEXT = "Приносим извинения, произошла внутренняя ошибка. Пожалуйста, попробуйте позже."
+
+
+def retry_keyboard() -> InlineKeyboardMarkup:
+    """Одна кнопка возврата — для ошибок и прочих сообщений, из которых иначе некуда нажать."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Попробовать еще раз", callback_data="check_another")],
+    ])
+
+
+def limit_keyboard() -> InlineKeyboardMarkup:
+    """То же плюс объяснение, почему лимиты вообще есть. Только для исчерпанного лимита."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("ℹ️ Больше об ограничениях", callback_data="learn_more")],
-        [InlineKeyboardButton("✅ Проверить креатив", callback_data="check_another")],
+        [InlineKeyboardButton("✅ Попробовать еще раз", callback_data="check_another")],
     ])
 
 async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE, replace_message: bool = True) -> None:
@@ -272,7 +284,7 @@ async def agree_and_upload(query, context: ContextTypes.DEFAULT_TYPE, replace_me
     if is_user_blocked(user_id): return
     remaining = get_remaining_requests(user_id)
     if remaining <= 0:
-        await query.message.reply_text(LIMIT_TEXT, reply_markup=dead_end_keyboard())
+        await query.message.reply_text(LIMIT_TEXT, reply_markup=limit_keyboard())
         return
 
     context.user_data['awaiting_creative'] = True
@@ -371,7 +383,7 @@ async def check_another(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     remaining = get_remaining_requests(user_id)
     
     if remaining <= 0:
-        await query.message.reply_text(LIMIT_TEXT, reply_markup=dead_end_keyboard())
+        await query.message.reply_text(LIMIT_TEXT, reply_markup=limit_keyboard())
         return
 
     context.user_data['awaiting_creative'] = True
@@ -412,7 +424,7 @@ async def show_cases(query, context: ContextTypes.DEFAULT_TYPE, session_idx: int
     if not cited:
         await query.message.reply_text(
             "Решения для этого заключения недоступны (возможно, бот перезапускался).",
-            reply_markup=dead_end_keyboard()
+            reply_markup=retry_keyboard()
         )
         return
     keyboard = [
@@ -432,14 +444,14 @@ async def show_case_detail(query, context: ContextTypes.DEFAULT_TYPE, session_id
     if idx < 0 or idx >= len(cited):
         await query.message.reply_text(
             "Решение не найдено, попробуйте заново.",
-            reply_markup=dead_end_keyboard()
+            reply_markup=retry_keyboard()
         )
         return
     details = backend.get_case_details(cited[idx])
     if not details:
         await query.message.reply_text(
             "Не удалось найти текст этого решения.",
-            reply_markup=dead_end_keyboard()
+            reply_markup=retry_keyboard()
         )
         return
     keyboard = [
@@ -458,7 +470,7 @@ async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TY
     """Правку уже отправленного сообщения Telegram шлёт отдельным апдейтом: разбирать её бот не умеет."""
     await update.edited_message.reply_text(
         "Правки в уже отправленном сообщении я не вижу. Пришлите исправленный вариант новым сообщением.",
-        reply_markup=dead_end_keyboard()
+        reply_markup=retry_keyboard()
     )
 
 
@@ -477,13 +489,13 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         user_logger.warning("Попытка отправить креатив без получения разрешения (из главного меню).")
         await update.message.reply_text(
             "Пожалуйста, нажмите на одну из кнопок, чтобы продолжить.",
-            reply_markup=dead_end_keyboard()
+            reply_markup=retry_keyboard()
         )
         return
 
     # Предварительная проверка лимита, без списания
     if get_remaining_requests(user.id) <= 0:
-        await update.message.reply_text(LIMIT_TEXT, reply_markup=dead_end_keyboard())
+        await update.message.reply_text(LIMIT_TEXT, reply_markup=limit_keyboard())
         user_logger.warning("Попытка запроса при исчерпанном лимите.")
         return
 
@@ -491,9 +503,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data['awaiting_creative'] = False
 
         error_text = f"Проверьте ваш файл: поддерживаются только файлы формата .jpg, .png и .pdf. не более {MAX_FILE_SIZE_MB} МБ."
-        error_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Попробовать еще раз", callback_data="check_another")]
-        ])
+        error_keyboard = retry_keyboard()
 
         temp_file_path = None
         try:
@@ -717,8 +727,8 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.error(f"Критическая ошибка в handle_creative для user {user.id}: {e}", exc_info=True)
             user_logger.error(f"КРИТИЧЕСКАЯ ОШИБКА В handle_creative: {e}", exc_info=True)
             await update.message.reply_text(
-                "Приносим извинения, произошла внутренняя ошибка. Пожалуйста, попробуйте позже.",
-                reply_markup=dead_end_keyboard()
+                INTERNAL_ERROR_TEXT,
+                reply_markup=retry_keyboard()
             )
             if ADMIN_USER_ID:
                 await context.bot.send_message(ADMIN_USER_ID, f"Авария у пользователя {user.id} (@{user.username})!\nОшибка: {e}")
@@ -747,9 +757,33 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         await update.message.reply_text(f"Произошла ошибка при разблокировке: {e}")
 
+# Сетевые обрывы и конфликт поллинга: пишем в лог, но админа не дёргаем.
+# Они повторяются в цикле с backoff'ом, поэтому одно событие давало лавину сообщений.
+TRANSIENT_ERRORS = (
+    telegram.error.NetworkError,   # включая TimedOut
+    telegram.error.Conflict,       # два инстанса на одном токене
+    httpx.TransportError,          # ReadError, RemoteProtocolError и прочие обрывы
+)
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Глобальный обработчик необработанных исключений в хэндлерах."""
     logger.error("Необработанное исключение при обработке апдейта", exc_info=context.error)
+
+    if isinstance(context.error, TRANSIENT_ERRORS):
+        return
+
+    # Ошибки уровня поллинга приходят без апдейта — отвечать некому.
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                INTERNAL_ERROR_TEXT,
+                reply_markup=retry_keyboard()
+            )
+        except Exception:
+            pass
+
     if ADMIN_USER_ID:
         try:
             await context.bot.send_message(

@@ -7,3 +7,4 @@ tqdm
 pytz
 python-dotenv
 pypdf
+httpx
