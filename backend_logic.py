@@ -263,14 +263,15 @@ def initialize_backend(logs_dir_path: str):
 
     # --- Загрузка правового корпуса ---
     legal_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'legal')
-    LEGAL = LegalCorpus(os.path.join(legal_dir, 'zakon.md'), os.path.join(legal_dir, 'rukovodstva.md'))
+    LEGAL = LegalCorpus(os.path.join(legal_dir, 'zakon.md'), os.path.join(legal_dir, 'rukovodstva.md'),
+                        os.path.join(legal_dir, 'zakon_future.md'))
 
     # Роутер выбирает статьи из готового списка, а не вспоминает их по памяти:
     # иначе он не знает о статьях, появившихся после knowledge cutoff модели.
     menu = "\n".join(LEGAL.law_sections[k].splitlines()[0].replace('### ', '') for k in LEGAL.law_order)
     PROMPT_1_PREPROCESSING = PROMPT_1_PREPROCESSING.replace("{{articles_menu}}", menu)
     print(f"[LEGAL] статей в законе: {len(LEGAL.law_sections)}, в руководствах: {len(LEGAL.guide_sections)}, "
-          f"меню роутера: {len(menu)} симв.")
+          f"отложенных редакций: {len(LEGAL.future_sections)}, меню роутера: {len(menu)} симв.")
 
 
 # ===============================================================
@@ -662,8 +663,10 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         # 2.1. Роутинг: какие статьи подгружаем в промпт
         articles_rag = articles_from_rag(rag_results)
         articles = order_articles(articles_pre + articles_rag)
+        future_text = LEGAL.future_law_for(articles)
         route_log = (f"[LEGAL] препроцессинг: {articles_pre or '—'} | RAG: {sorted(set(articles_rag)) or '—'} "
-                     f"| итого: {articles or '—'}")
+                     f"| итого: {articles or '—'}"
+                     + (" | есть отложенные редакции" if future_text else ""))
         print(route_log, flush=True)
         if user_logger:
             user_logger.info(route_log)
@@ -674,6 +677,7 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
         final_prompt = final_prompt.replace("{{law_text}}", LEGAL.law_for(articles) or "(статьи не определены)")
         final_prompt = final_prompt.replace("{{guidelines_text}}", LEGAL.guidelines_for(articles) or "(нет применимых руководств)")
+        final_prompt = final_prompt.replace("{{future_law_text}}", future_text or "(отложенных редакций нет)")
         final_prompt = final_prompt.replace("{{current_date}}", current_date_ru())
         final_result = await gemini_client.generate([final_prompt], use_fallback=use_fallback, user_logger=user_logger, stage="final")
         
