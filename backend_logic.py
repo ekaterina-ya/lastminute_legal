@@ -441,6 +441,31 @@ def sanitize_html(text: str) -> str:
     return result
 
 
+# Руководства ФАС: номер приказа из реквизитов → PDF на сайте ФАС.
+# Ключи соответствуют разделу «Источники» в data/legal/rukovodstva.md.
+GUIDE_URLS = {
+    "821/23": "https://fas.gov.ru/attachment/730230/download?1699949694",   # понятие рекламы (ст. 2/3, отфильтровано GUIDE_EXCLUDE)
+    "1079/23": "https://fas.gov.ru/attachment/743635/download?1706184971",  # общие требования + алкоголь, ЛС, БАД
+    "410/24": "https://fas.gov.ru/attachment/779559/download?1722597998",   # игры и пари
+    "412/24": "https://fas.gov.ru/attachment/788418/download?1726581409",   # финансовые услуги + вывеска и реклама
+    "497/24": "https://fas.gov.ru/attachment/788419/download?1726581409",   # наружная реклама, в rukovodstva.md пока не вошло
+    # 65/26 (опора дорожного знака) — ссылки нет, реквизиты останутся без подсветки
+}
+
+GUIDE_PRIKAZ_RE = re.compile(
+    r"Приказ\s+ФАС\s+России\s+от\s+\d{1,2}\.\d{1,2}\.\d{4}\s*[N№Н]?\s*(\d{2,4}/\d{2})"
+)
+
+
+def link_guidelines(text: str) -> str:
+    """Делает реквизиты приказа ФАС кликабельной ссылкой на PDF руководства."""
+    def _replace(match):
+        url = GUIDE_URLS.get(match.group(1))
+        return f'<a href="{url}">{match.group(0)}</a>' if url else match.group(0)
+
+    return GUIDE_PRIKAZ_RE.sub(_replace, text)
+
+
 def postprocess_final_answer(final_text):
     """Шаг 4: Постобработка - добавление ссылок и дисклеймера."""
     print("Шаг 4: Пост-обработка ответа...")
@@ -474,7 +499,10 @@ def postprocess_final_answer(final_text):
 
     # Применяем замену ко всему тексту с помощью созданного шаблона.
     processed_text = pattern.sub(replace_with_link, final_text)
-    
+
+    # Реквизиты приказов ФАС → ссылки на PDF руководств
+    processed_text = link_guidelines(processed_text)
+
     # Санитизация HTML: экранируем невалидные символы < и >, оставляя только разрешённые теги
     processed_text = sanitize_html(processed_text)
     
