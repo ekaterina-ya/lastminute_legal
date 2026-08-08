@@ -449,7 +449,7 @@ GUIDE_URLS = {
     "410/24": "https://fas.gov.ru/attachment/779559/download?1722597998",   # игры и пари
     "412/24": "https://fas.gov.ru/attachment/788418/download?1726581409",   # финансовые услуги + вывеска и реклама
     "497/24": "https://fas.gov.ru/attachment/788419/download?1726581409",   # наружная реклама, в rukovodstva.md пока не вошло
-    # 65/26 (опора дорожного знака) — ссылки нет, реквизиты останутся без подсветки
+    "65/26": "https://fas.gov.ru/attachment/867668/download?1771589173",    # опора дорожного знака (ст. 2/3, отфильтровано)
 }
 
 GUIDE_PRIKAZ_RE = re.compile(
