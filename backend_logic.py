@@ -13,6 +13,8 @@ import logging
 import json
 import asyncio
 import sys
+from datetime import datetime
+import pytz
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'legal'))
 from legal_loader import LegalCorpus, normalize_article  # noqa: E402
@@ -457,6 +459,22 @@ GUIDE_PRIKAZ_RE = re.compile(
 )
 
 
+_MONTHS_RU = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+
+
+def current_date_ru() -> str:
+    """Сегодняшняя дата по Москве прописью: «8 августа 2026 г.».
+
+    Считается на каждый запрос, а не при старте: воркер живёт неделями,
+    и замороженная на старте дата вернула бы ту же ошибку, только незаметно.
+    """
+    now = datetime.now(pytz.timezone('Europe/Moscow'))
+    return f"{now.day} {_MONTHS_RU[now.month - 1]} {now.year} г."
+
+
 def link_guidelines(text: str) -> str:
     """Делает реквизиты приказа ФАС кликабельной ссылкой на PDF руководства."""
     def _replace(match):
@@ -656,6 +674,7 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         final_prompt = final_prompt.replace("{{rag_cases_context}}", rag_context)
         final_prompt = final_prompt.replace("{{law_text}}", LEGAL.law_for(articles) or "(статьи не определены)")
         final_prompt = final_prompt.replace("{{guidelines_text}}", LEGAL.guidelines_for(articles) or "(нет применимых руководств)")
+        final_prompt = final_prompt.replace("{{current_date}}", current_date_ru())
         final_result = await gemini_client.generate([final_prompt], use_fallback=use_fallback, user_logger=user_logger, stage="final")
         
         if final_result["status"] == "SAFETY":

@@ -454,6 +454,14 @@ async def show_case_detail(query, context: ContextTypes.DEFAULT_TYPE, session_id
     )
 
 
+async def handle_edited_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Правку уже отправленного сообщения Telegram шлёт отдельным апдейтом: разбирать её бот не умеет."""
+    await update.edited_message.reply_text(
+        "Правки в уже отправленном сообщении я не вижу. Пришлите исправленный вариант новым сообщением.",
+        reply_markup=dead_end_keyboard()
+    )
+
+
 async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Главный обработчик креативов с новой логикой обработки ошибок."""
     user = update.message.from_user
@@ -825,8 +833,13 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("unblock", unblock_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_creative))
-    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_creative))
+    # ~UpdateType.EDITED обязателен: правки Telegram шлёт в тот же MessageHandler,
+    # но update.message у них None — handle_creative падал на первой же строке.
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & ~filters.UpdateType.EDITED, handle_creative))
+    application.add_handler(MessageHandler(
+        (filters.PHOTO | filters.Document.ALL) & ~filters.UpdateType.EDITED, handle_creative))
+    application.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE, handle_edited_message))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_error_handler(error_handler)
 
