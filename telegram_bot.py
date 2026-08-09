@@ -84,7 +84,8 @@ def init_db():
             last_request_date TEXT,
             consecutive_blocks INTEGER DEFAULT 0,
             total_blocks INTEGER DEFAULT 0,
-            is_blocked INTEGER DEFAULT 0
+            is_blocked INTEGER DEFAULT 0,
+            bot_blocked INTEGER DEFAULT 0
         )
     ''')
     try:
@@ -93,6 +94,11 @@ def init_db():
         cursor.execute('ALTER TABLE users ADD COLUMN is_blocked INTEGER DEFAULT 0')
     except sqlite3.OperationalError:
         pass # Колонки уже существуют
+    # Отдельным try: в старых базах первые три ALTER падают, и до этой колонки очередь не доходит
+    try:
+        cursor.execute('ALTER TABLE users ADD COLUMN bot_blocked INTEGER DEFAULT 0')
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -255,6 +261,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         except (ValueError, IndexError):
             return
         await show_case_detail(query, context, session_idx, idx)
+    elif query.data == "broadcast_send":
+        await run_broadcast(query, context)
+    elif query.data == "broadcast_cancel":
+        await query.edit_message_text("Рассылка отменена.")
 
 LIMIT_TEXT = "Лимит на сегодня исчерпан. Спасибо за доверие, буду рад помочь завтра!"
 
@@ -845,6 +855,111 @@ async def run_daily_scheduler():
             await asyncio.sleep(300)
 
 # ===============================================================
+# БЛОК 5: РАЗОВАЯ РАССЫЛКА
+# ===============================================================
+
+BROADCAST_PHOTO_PATH = 'data/broadcast.jpg'
+
+# Подпись к фото в Telegram — не длиннее 1024 символов (теги HTML не считаются).
+BROADCAST_TEXT = """Всем привет!
+
+Этот бот существует уже больше года. За это время им воспользовалось более пятисот человек, для десятков из вас он стал постоянным помощником в работе. У бота появились такие же некоммерческие проекты-побратимы: <a href="https://search.delay-rag.ru">сервис поиска практики ФАС</a> и <a href="https://blog.delay-rag.ru/mcp-konniektor-k-poisku-po-praktikie-fas/">MCP-коннектор</a> к нему. С двумя крупными коммерческими компаниями мы приземлили бота на их внутренние процессы согласования креативов.
+
+Этой первой (и очень-очень редкой, обещаю) рассылкой я бы хотела анонсировать большой пакет изменений в честь первого Дня рождения проекта: анализ ваших креативов с ним станет ещё глубже и достовернее.
+
+Бот остаётся некоммерческим на тех же условиях, что и весь этот год. Ваше доверие и тёплая обратная связь — это лучшая благодарность для автора.
+
+delay-rag.ru · <a href="https://t.me/delay_RAG">TG-канал «Делай RAG»</a>"""
+
+
+def get_broadcast_user_ids() -> list[int]:
+    """Все, кто хоть раз пользовался ботом. В личных чатах user_id = chat_id."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users WHERE bot_blocked = 0 ORDER BY user_id")
+    user_ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return user_ids
+
+
+def mark_bot_blocked(user_id: int):
+    """Пользователь заблокировал бота — в следующие рассылки не берём."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET bot_blocked = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик команды /broadcast: предпросмотр рассылки. Только для администратора."""
+    if not ADMIN_USER_ID or str(update.effective_user.id) != ADMIN_USER_ID:
+        logger.warning(f"Попытка несанкционированного доступа к команде /broadcast от пользователя {update.effective_user.id}")
+        return
+
+    if not os.path.exists(BROADCAST_PHOTO_PATH):
+        await update.message.reply_text(f"Картинка для рассылки не найдена: {BROADCAST_PHOTO_PATH}")
+        return
+
+    with open(BROADCAST_PHOTO_PATH, 'rb') as photo:
+        preview = await update.message.reply_photo(photo, caption=BROADCAST_TEXT, parse_mode=ParseMode.HTML)
+
+    # file_id из предпросмотра переиспользуем в рассылке: картинка уедет на серверы Telegram один раз
+    context.bot_data['broadcast_file_id'] = preview.photo[-1].file_id
+
+    total = len(get_broadcast_user_ids())
+    await update.message.reply_text(
+        f"👆 Так рассылку увидят получатели. Адресатов: <b>{total}</b>.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📣 Разослать ({total})", callback_data="broadcast_send")],
+            [InlineKeyboardButton("Отмена", callback_data="broadcast_cancel")],
+        ])
+    )
+
+
+async def run_broadcast(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перебор пользователей: функционала «разослать всем» в Bot API нет."""
+    if not ADMIN_USER_ID or str(query.from_user.id) != ADMIN_USER_ID:
+        return
+
+    file_id = context.bot_data.get('broadcast_file_id')
+    if not file_id:
+        await query.edit_message_text("Предпросмотр устарел, сделайте /broadcast заново.")
+        return
+
+    # Кнопку убираем сразу: второе нажатие отправило бы рассылку дважды
+    await query.edit_message_text("📣 Рассылка пошла…")
+
+    sent = blocked = failed = 0
+    for user_id in get_broadcast_user_ids():
+        try:
+            await context.bot.send_photo(user_id, file_id, caption=BROADCAST_TEXT, parse_mode=ParseMode.HTML)
+            sent += 1
+        except telegram.error.RetryAfter as e:
+            # Уперлись в лимит Telegram — ждём столько, сколько просит, и пробуем этого же адресата ещё раз
+            await asyncio.sleep(e.retry_after)
+            try:
+                await context.bot.send_photo(user_id, file_id, caption=BROADCAST_TEXT, parse_mode=ParseMode.HTML)
+                sent += 1
+            except Exception as retry_error:
+                failed += 1
+                logger.warning(f"Рассылка: не доставлено {user_id} после ожидания: {retry_error}")
+        except telegram.error.Forbidden:
+            mark_bot_blocked(user_id)
+            blocked += 1
+        except Exception as e:
+            failed += 1
+            logger.warning(f"Рассылка: не доставлено {user_id}: {e}")
+        await asyncio.sleep(0.05)  # лимит ~30 сообщений в секунду, идём с запасом
+
+    logger.info(f"Рассылка завершена: доставлено {sent}, заблокировали бота {blocked}, ошибок {failed}")
+    await query.message.reply_text(
+        f"✅ Рассылка завершена.\nДоставлено: {sent}\nЗаблокировали бота: {blocked}\nОшибок: {failed}"
+    )
+
+
+# ===============================================================
 # БЛОК 6: ЗАПУСК БОТА
 # ===============================================================
 
@@ -880,6 +995,7 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("unblock", unblock_command))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
     # ~UpdateType.EDITED обязателен: правки Telegram шлёт в тот же MessageHandler,
     # но update.message у них None — handle_creative падал на первой же строке.
     application.add_handler(MessageHandler(
