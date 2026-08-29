@@ -165,11 +165,35 @@ class LegalCorpus:
         return f"{self.guide_preamble}\n\n{body}".strip()
 
     # --- routed (вариант B) ---
-    def law_for(self, articles: list[str]) -> str:
+    def _in_force_section(self, key: str, now: date) -> str:
+        """Текст статьи на дату: наступившая отложенная редакция важнее zakon.md.
+
+        zakon.md собирается на дату сборки и сам в срок не обновится — пока
+        корпус не пересобрали, действующую редакцию берём из zakon_future.md.
+        Иначе бот молча анализировал бы по недействующему тексту.
+        """
+        best: tuple[date, str] | None = None
+        for k, when, text in self.future_sections:
+            if k == key and when <= now and (best is None or when >= best[0]):
+                best = (when, text)
+        if best is None:
+            return self.law_sections.get(key, "")
+        head, _stamp, *rest = best[1].splitlines()  # штамп «Вступает в силу с …» снимаем: уже действует
+        while rest and not rest[0].strip():
+            rest.pop(0)
+        return "\n".join([head, *rest]).rstrip()
+
+    def stale_editions(self, today: date | None = None) -> list[str]:
+        """Статьи, чья отложенная редакция уже действует, а zakon.md ещё старый."""
+        now = today or date.today()
+        return sorted({k for k, when, _ in self.future_sections if when <= now})
+
+    def law_for(self, articles: list[str], today: date | None = None) -> str:
+        now = today or date.today()
         keys = [a for a in articles if a in self.law_sections]
         if not keys:
             return ""
-        body = "\n\n".join(self.law_sections[k] for k in keys)
+        body = "\n\n".join(self._in_force_section(k, now) for k in keys)
         return f"{self.law_preamble}\n\n{body}".strip()
 
     def guidelines_for(self, articles: list[str]) -> str:
@@ -196,8 +220,11 @@ class LegalCorpus:
             if key not in wanted or not now < when <= limit:
                 continue
             head, stamp, *rest = text.splitlines()
+            # Сравниваем с редакцией, действующей накануне вступления, а не с
+            # сегодняшней: если у статьи цепочка редакций, каждая должна
+            # показывать только свою правку и со своей датой.
             # У совсем новой статьи действующей редакции нет — тогда изменилось всё.
-            current = "\n".join(self.law_sections.get(key, "").splitlines()[1:])
+            current = "\n".join(self._in_force_section(key, when - timedelta(days=1)).splitlines()[1:])
             changed = _changed_lines(current, "\n".join(rest))
             if changed:
                 body.append("\n".join([head, stamp, *changed]))

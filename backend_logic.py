@@ -664,9 +664,13 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         articles_rag = articles_from_rag(rag_results)
         articles = order_articles(articles_pre + articles_rag)
         future_text = LEGAL.future_law_for(articles)
+        # Редакция вступила в силу, а zakon.md ещё не пересобран — статья ушла в
+        # промпт из zakon_future.md. Повод пересобрать корпус в студии.
+        stale = [a for a in LEGAL.stale_editions() if a in articles]
         route_log = (f"[LEGAL] препроцессинг: {articles_pre or '—'} | RAG: {sorted(set(articles_rag)) or '—'} "
                      f"| итого: {articles or '—'}"
-                     + (" | есть отложенные редакции" if future_text else ""))
+                     + (" | есть отложенные редакции" if future_text else "")
+                     + (f" | корпус устарел, редакция из zakon_future: {stale}" if stale else ""))
         print(route_log, flush=True)
         if user_logger:
             user_logger.info(route_log)
