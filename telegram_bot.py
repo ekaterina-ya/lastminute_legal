@@ -59,6 +59,7 @@ ADMIN_USER_ID = os.getenv('ADMIN_USER_ID')
 DB_PATH = os.getenv('DATABASE_PATH', 'data/user_data.db')
 CHANNEL_URL = os.getenv('TELEGRAM_CHANNEL_URL')
 ADMIN_CONTACT_URL = os.getenv('ADMIN_CONTACT_URL')
+HEARTBEAT_PATH = os.getenv('HEARTBEAT_PATH', 'heartbeat')
 
 # --- Настройки бота ---
 DAILY_LIMIT = 10
@@ -854,6 +855,21 @@ async def run_daily_scheduler():
             # Ждем 5 минут перед повторной попыткой, чтобы не спамить лог ошибками
             await asyncio.sleep(300)
 
+
+async def touch_heartbeat():
+    """Отметка живости: healthcheck контейнера смотрит на время правки файла.
+
+    У воркера нет HTTP-эндпоинта, а «процесс жив» ничего не доказывает —
+    зависший процесс тоже жив.
+    """
+    while True:
+        try:
+            with open(HEARTBEAT_PATH, 'w') as f:
+                f.write(datetime.now().isoformat())
+        except OSError as e:
+            print(f"Не удалось обновить отметку живости: {e}")
+        await asyncio.sleep(60)
+
 # ===============================================================
 # БЛОК 5: РАЗОВАЯ РАССЫЛКА
 # ===============================================================
@@ -964,8 +980,9 @@ async def run_broadcast(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ===============================================================
 
 async def post_init(application: Application) -> None:
-    """Запускается после инициализации application: планировщик и уведомление админа."""
+    """Запускается после инициализации application: планировщик, отметка живости и уведомление админа."""
     application.create_task(run_daily_scheduler())
+    application.create_task(touch_heartbeat())
     if ADMIN_USER_ID:
         await application.bot.send_message(ADMIN_USER_ID, "Бот успешно запущен/перезапущен!")
 
