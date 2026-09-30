@@ -268,8 +268,9 @@ def initialize_backend(logs_dir_path: str):
 
     # Роутер выбирает статьи из готового списка, а не вспоминает их по памяти:
     # иначе он не знает о статьях, появившихся после knowledge cutoff модели.
-    menu = "\n".join(LEGAL.law_sections[k].splitlines()[0].replace('### ', '') for k in LEGAL.law_order)
-    PROMPT_1_PREPROCESSING = PROMPT_1_PREPROCESSING.replace("{{articles_menu}}", menu)
+    # Меню подставляется на каждый запрос (LEGAL.menu_on): с даты вступления в
+    # нём появляются новые статьи и новые названия без пересборки zakon.md.
+    menu = LEGAL.menu_on()
     print(f"[LEGAL] статей в законе: {len(LEGAL.law_sections)}, в руководствах: {len(LEGAL.guide_sections)}, "
           f"отложенных редакций: {len(LEGAL.future_sections)}, меню роутера: {len(menu)} симв.")
 
@@ -385,7 +386,7 @@ def articles_from_rag(search_results_df) -> list:
 def order_articles(articles: list) -> list:
     """Уникальные статьи в порядке их следования в законе."""
     uniq = set(articles)
-    return [k for k in LEGAL.law_order if k in uniq]
+    return [k for k in LEGAL.order_on() if k in uniq]
 
 def sanitize_html(text: str) -> str:
     """
@@ -641,7 +642,7 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         
         # 1. Предварительная обработка контента через GeminiClient
         print("Шаг 1: Предварительная обработка контента...")
-        content_for_preprocessing = [PROMPT_1_PREPROCESSING] + user_content_for_api
+        content_for_preprocessing = [PROMPT_1_PREPROCESSING.replace("{{articles_menu}}", LEGAL.menu_on())] + user_content_for_api
         preprocess_result = await gemini_client.generate(content_for_preprocessing, use_fallback=use_fallback, user_logger=user_logger, stage="preprocess")
         
         if preprocess_result["status"] == "SAFETY":

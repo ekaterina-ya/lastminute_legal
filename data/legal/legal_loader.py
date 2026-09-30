@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import difflib
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 _LAW_ART_RE = re.compile(r"^### Статья (\S+?)\.\s")
 _GUIDE_ART_RE = re.compile(r"^## ст\.\s*(\S+)")
@@ -27,6 +27,17 @@ _FUTURE_DATE_RE = re.compile(r"^Вступает в силу с (\d{1,2})\.(\d{1
 # только шумит: столько креативы не живут.
 FUTURE_HORIZON_DAYS = 180
 
+# «Сегодня» — по Москве: даты вступления в силу московские, а контейнер бота
+# живёт в UTC (проверено 30.09.2026) — иначе с 00:00 до 03:00 МСК в день
+# вступления бот отвечал бы по вчерашней редакции. Перехода на летнее время в
+# России нет с 2014 года, поэтому хватает фиксированного сдвига.
+MSK = timezone(timedelta(hours=3))
+
+
+def _today() -> date:
+    return datetime.now(MSK).date()
+
+
 # Руководства по понятию рекламы (классификация «реклама / не реклама»)
 # в этой фиче не используются — это отдельная будущая задача.
 GUIDE_EXCLUDE = {"ст. 2", "ст. 3"}
@@ -36,6 +47,11 @@ def normalize_article(raw: str) -> str | None:
     """«п. 2 ч. 3 ст. 5» / «ст. 28.1» → «ст. 5» / «ст. 28.1». None, если статьи нет."""
     m = _ART_NUM_RE.search(raw or "")
     return f"ст. {m.group(1)}" if m else None
+
+
+def _article_num(key: str) -> tuple:
+    """«ст. 29.2» → (29, 2): порядок статей по номеру."""
+    return tuple(int(p) for p in key.split(" ", 1)[1].split("."))
 
 
 def _parse_sections(text: str, header_re: re.Pattern) -> tuple[str, dict, list]:
@@ -185,12 +201,34 @@ class LegalCorpus:
 
     def stale_editions(self, today: date | None = None) -> list[str]:
         """Статьи, чья отложенная редакция уже действует, а zakon.md ещё старый."""
-        now = today or date.today()
+        now = today or _today()
         return sorted({k for k, when, _ in self.future_sections if when <= now})
 
+    def order_on(self, today: date | None = None) -> list[str]:
+        """Статьи, действующие на дату, в порядке закона.
+
+        Новая статья, которой ещё нет в zakon.md, появляется с даты вступления
+        своей отложенной редакции — на своё место по номеру, без пересборки.
+        """
+        now = today or _today()
+        order = list(self.law_order)
+        new = sorted({k for k, when, _ in self.future_sections if when <= now and k not in self.law_sections},
+                     key=_article_num)
+        for key in new:
+            pos = next((i for i, k in enumerate(order) if _article_num(k) > _article_num(key)), len(order))
+            order.insert(pos, key)
+        return order
+
+    def menu_on(self, today: date | None = None) -> str:
+        """Меню роутера на дату: «Статья N. Название» по действующим редакциям."""
+        now = today or _today()
+        return "\n".join(self._in_force_section(k, now).splitlines()[0].replace('### ', '')
+                         for k in self.order_on(now))
+
     def law_for(self, articles: list[str], today: date | None = None) -> str:
-        now = today or date.today()
-        keys = [a for a in articles if a in self.law_sections]
+        now = today or _today()
+        in_force = set(self.order_on(now))
+        keys = [a for a in articles if a in in_force]
         if not keys:
             return ""
         body = "\n\n".join(self._in_force_section(k, now) for k in keys)
@@ -212,7 +250,7 @@ class LegalCorpus:
         вовремя, промолчать лучше, чем сказать «вступает в силу» о том, что уже
         действует.
         """
-        now = today or date.today()
+        now = today or _today()
         limit = now + timedelta(days=FUTURE_HORIZON_DAYS)
         wanted = set(articles)
         body = []
