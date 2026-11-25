@@ -48,32 +48,43 @@ logger.addHandler(file_handler)
 
 # --- Цены на модели Gemini ---
 # (цена_за_1M_input, цена_за_1M_output) в USD, paid-tier.
-# Источник: https://ai.google.dev/gemini-api/docs/pricing (на 2026-05-28).
-# ВНИМАНИЕ: для 2.5-pro и 3.1-pro-preview цены удваиваются на запросах >200k токенов
-# (input: 1.25→2.50 и 2.00→4.00; output: 10→15 и 12→18). Здесь учитывается только
-# базовый тариф ≤200k. Если запросы перевалят за 200k — итог будет заниженным.
+# Hydrogen и 3.1 Pro сверены: https://aistudio.google.com/docs/pricing (25.11.2026).
+# Output оплачивается вместе с thinking. Старые модели оставлены для истории логов.
+# Для остальных моделей здесь по-прежнему только базовый тариф ≤200k.
 MODEL_PRICES_USD_PER_M = {
     "gemini-2.5-pro":             (1.25, 10.00),
     "gemini-2.5-flash":           (0.30,  2.50),
     "gemini-3.1-pro-preview":     (2.00, 12.00),
     "gemini-3.1-pro":             (2.00, 12.00),  # на случай если модель переименуют — алиас
+    "gemini-4-hydrogen":          (1.50,  7.50),
     "gemini-3.5-flash":           (1.50,  9.00),
     "gemini-3.1-flash-lite":      (0.25,  1.50),
     "gemini-3-flash-preview":     (0.50,  3.00),
 }
 
+MODEL_CACHED_INPUT_USD_PER_M = {
+    "gemini-3.1-pro-preview": 0.20,
+    "gemini-3.1-pro": 0.20,
+    "gemini-4-hydrogen": 0.075,
+}
+
 USAGE_LINE_RE = re.compile(
     r"\[USAGE\] stage=(\S+) model=(\S+) input=(\d+) output=(\d+) cached=(\d+) ok=([01])"
+    r"(?: thinking=(\d+))?"
 )
 
 
-def _estimate_cost_usd(model, input_tokens, output_tokens):
+def _estimate_cost_usd(model, input_tokens, output_tokens, cached_tokens=0, thinking_tokens=0):
     """Возвращает оценку стоимости в USD или None, если модели нет в прайсе."""
     price = MODEL_PRICES_USD_PER_M.get(model)
     if price is None:
         return None
     in_price, out_price = price
-    return (input_tokens / 1_000_000) * in_price + (output_tokens / 1_000_000) * out_price
+    cache_price = MODEL_CACHED_INPUT_USD_PER_M.get(model, in_price)
+    if model in ('gemini-3.1-pro-preview', 'gemini-3.1-pro') and input_tokens > 200_000:
+        in_price, out_price, cache_price = 4.00, 18.00, 0.40
+    return ((input_tokens - cached_tokens) * in_price + cached_tokens * cache_price
+            + (output_tokens + thinking_tokens) * out_price) / 1_000_000
 
 
 def _fmt_tokens(n):
@@ -124,7 +135,7 @@ def parse_request_block(block_text, user_id, username):
         'request_duration_sec': None,
 
         # Структурированные события расхода токенов из [USAGE]-строк
-        # Список словарей: [{'stage', 'model', 'input', 'output', 'cached', 'ok'}, ...]
+        # Старые строки без thinking читаются с нулём, прежний расход не восстановить из них.
         'usage_events': [],
     }
 
@@ -180,13 +191,14 @@ def parse_request_block(block_text, user_id, username):
 
     # Новый источник истины: [USAGE]-строки с разбивкой по стадиям и моделям.
     for m in USAGE_LINE_RE.finditer(block_text):
-        stage, model, in_t, out_t, cached_t, ok = m.groups()
+        stage, model, in_t, out_t, cached_t, ok, thinking_t = m.groups()
         data['usage_events'].append({
             'stage': stage,
             'model': model,
             'input': int(in_t),
             'output': int(out_t),
             'cached': int(cached_t),
+            'thinking': int(thinking_t or 0),
             'ok': ok == '1',
         })
 
@@ -330,7 +342,7 @@ def generate_summary_report(df, db_path):
 
     # 5b. Разбивка по (стадия, модель) из [USAGE]-строк
     # Учитываем только успешные вызовы (ok=True).
-    stage_model_breakdown = {}  # {(stage, model): {'input', 'output', 'cached'}}
+    stage_model_breakdown = {}
     for events in df_today['usage_events']:
         if not isinstance(events, list):
             continue
@@ -338,10 +350,20 @@ def generate_summary_report(df, db_path):
             if not ev.get('ok'):
                 continue
             key = (ev['stage'], ev['model'])
-            agg = stage_model_breakdown.setdefault(key, {'input': 0, 'output': 0, 'cached': 0})
+            agg = stage_model_breakdown.setdefault(key, {
+                'input': 0, 'output': 0, 'cached': 0, 'thinking': 0, 'cost': 0.0,
+            })
             agg['input'] += ev['input']
             agg['output'] += ev['output']
             agg['cached'] += ev['cached']
+            agg['thinking'] += ev.get('thinking', 0)
+            # Порог 200k проверяется для отдельного вызова, а не для суммы за день.
+            cost = _estimate_cost_usd(ev['model'], ev['input'], ev['output'],
+                                      ev['cached'], ev.get('thinking', 0))
+            if cost is None:
+                agg['cost'] = None
+            elif agg['cost'] is not None:
+                agg['cost'] += cost
 
     # 7. Заполнили опросник
     feedback_users = df_today[df_today['полезность'].notna()]['telegram_id'].nunique()
@@ -366,7 +388,7 @@ def generate_summary_report(df, db_path):
     any_unknown_price = False
     if stage_model_breakdown:
         for (stage, model), agg in sorted(stage_model_breakdown.items()):
-            cost = _estimate_cost_usd(model, agg['input'], agg['output'])
+            cost = agg['cost']
             if cost is None:
                 any_unknown_price = True
                 cost_str = "цена ?"
@@ -375,7 +397,7 @@ def generate_summary_report(df, db_path):
                 cost_str = f"≈ ${cost:.2f}"
             api_lines.append(
                 f"• {stage} ({model}): in *{_fmt_tokens(agg['input'])}* / "
-                f"out *{_fmt_tokens(agg['output'])}*  {cost_str}"
+                f"out *{_fmt_tokens(agg['output'])}* / thinking *{_fmt_tokens(agg['thinking'])}*  {cost_str}"
             )
         suffix = " (часть моделей без цены)" if any_unknown_price else ""
         api_lines.append(f"• Итого ≈ *${total_cost_usd:.2f}*{suffix}")

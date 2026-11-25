@@ -334,7 +334,7 @@ async def learn_more(query, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text_part1 = (
         """ <b>Спасибо за ваш интерес к проекту!</b>
-Этот бот проверяет рекламные креативы на соответствие ФЗ «О рекламе», опираясь на более чем 2 тысячи решений ФАС, вынесенных за прошедшие 7 лет. Он работает по принципу Retrieval‑Augmented Generation (RAG): сначала ищет похожие кейсы, затем формирует ответ, обращаясь к нейросети Gemini 3.1 Pro (или Gemini 2.5 Pro, если 3.1 вдруг срабатывает с ошибками — это более старая модель, но бот больше полугода работал на ней, показывая высокое качество).
+Этот бот проверяет рекламные креативы на соответствие ФЗ «О рекламе», опираясь на более чем 2 тысячи решений ФАС, вынесенных за прошедшие 7 лет. Он работает по принципу Retrieval‑Augmented Generation (RAG): сначала ищет похожие кейсы, затем формирует ответ с помощью моделей Gemini. При техническом сбое основной модели бот пробует подготовить заключение с резервной.
 
 <i>О том, по каким критериям отбирались дела, как это было осуществлено технически, как структурирована база знаний, а также о других проектах создательницы бота Екатерины Якуненко вы можете прочесть в <a href="https://t.me/delay_RAG">канале «Делай RAG»</a>.</i>
 
@@ -605,10 +605,10 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 primary_error_message = analysis_result.get("message", "Неизвестная ошибка")
                 logger.error(f"Техническая ошибка (primary) для user {user.id}: {primary_error_message}")
                 if ADMIN_USER_ID:
-                    await context.bot.send_message(ADMIN_USER_ID, f"Авария в бэкенде (Gemini 3.1 Pro) у пользователя {user.id} (@{user.username})!\nОшибка: {primary_error_message}\n\nЗапускаю fallback (Gemini 2.5 Pro)...")
+                    await context.bot.send_message(ADMIN_USER_ID, f"Авария в основном режиме у пользователя {user.id} (@{user.username})!\nОшибка: {primary_error_message}\n\nЗапускаю резервную модель...")
 
                 await update.message.reply_text(
-                    "Приносим извинения, нейросеть Gemini 3.1 Pro не сработала из-за проблем на стороне Google. Мы подготовим заключение с нейросетью Gemini 2.5 Pro. Gemini 3.1 Pro скорее всего скоро починят, можете попробовать ещё раз позднее."
+                    "Основная нейросеть временно не ответила. Попробуем подготовить заключение с резервной моделью."
                 )
                 analysis_result = await backend.analyze_creative_flow(
                     file_bytes=file_bytes, text_content=text_content, file_path=temp_file_path,
@@ -660,7 +660,7 @@ async def handle_creative(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                 model_used = analysis_result.get("model_used", "unknown")
                 if model_used == 'fallback' and ADMIN_USER_ID:
-                    await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} (@{user.username}) успешно подготовлено с помощью Gemini 2.5 Pro (fallback) после сбоя Gemini 3.1 Pro.")
+                    await context.bot.send_message(ADMIN_USER_ID, f"✅ Заключение для пользователя {user.id} (@{user.username}) успешно подготовлено с резервной моделью после сбоя основного режима.")
 
                 final_output = analysis_result.get('final_output', "Произошла внутренняя ошибка.")
                 cited_cases = analysis_result.get('cited_case_ids', []) or []

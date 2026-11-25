@@ -12,6 +12,7 @@ import io
 import logging
 import json
 import asyncio
+import time
 import sys
 from datetime import datetime
 import pytz
@@ -47,23 +48,26 @@ def load_prompt_from_file(file_path):
         raise ValueError(f"КРИТИЧЕСКАЯ ОШИБКА: Файл с промптом не найден по пути '{file_path}'.")
 
 
-def _format_usage_line(stage, model, input_tokens, output_tokens, cached_tokens, ok):
+def _format_usage_line(stage, model, input_tokens, output_tokens, cached_tokens, ok,
+                       thinking_tokens=0, thinking_level=None, duration_ms=0):
     return (
         f"[USAGE] stage={stage} model={model} "
         f"input={int(input_tokens)} output={int(output_tokens)} cached={int(cached_tokens)} "
-        f"ok={int(bool(ok))}"
+        f"ok={int(bool(ok))} thinking={int(thinking_tokens)} "
+        f"level={thinking_level or 'default'} duration_ms={int(duration_ms)}"
     )
 
 
 def _extract_usage(response):
-    """Возвращает (input, output, cached) из usage_metadata. Нули, если поля нет."""
+    """Возвращает (input, output, cached, thinking) из usage_metadata."""
     usage = getattr(response, 'usage_metadata', None)
     if usage is None:
-        return 0, 0, 0
+        return 0, 0, 0, 0
     return (
         getattr(usage, 'prompt_token_count', 0) or 0,
         getattr(usage, 'candidates_token_count', 0) or 0,
         getattr(usage, 'cached_content_token_count', 0) or 0,
+        getattr(usage, 'thoughts_token_count', 0) or 0,
     )
 
 
@@ -73,7 +77,7 @@ def _extract_usage(response):
 
 class GeminiClient:
     """
-    Обёртка над google.generativeai для работы с Gemini.
+    Обёртка над google-genai для работы с Gemini.
     При смене модели (на другую LLM) — менять только этот класс.
     """
     
@@ -84,7 +88,9 @@ class GeminiClient:
         types.SafetySetting(category='HARM_CATEGORY_DANGEROUS_CONTENT', threshold='BLOCK_NONE'),
     ]
     
-    def __init__(self, api_key: str, primary_model: str, fallback_model: str, embedding_model: str):
+    def __init__(self, api_key: str, primary_model: str, fallback_model: str, embedding_model: str,
+                 preprocess_model: str = None, preprocess_thinking_level: str = None,
+                 primary_thinking_level: str = None, fallback_thinking_level: str = None):
         self._client = genai.Client(
             api_key=api_key,
             http_options=types.HttpOptions(timeout=180_000)  # 180 секунд в миллисекундах
@@ -92,6 +98,10 @@ class GeminiClient:
         self._embedding_model_name = embedding_model
         self._primary_model_name = primary_model
         self._fallback_model_name = fallback_model
+        self._preprocess_model_name = preprocess_model or primary_model
+        self._preprocess_thinking_level = preprocess_thinking_level
+        self._primary_thinking_level = primary_thinking_level
+        self._fallback_thinking_level = fallback_thinking_level
     
     async def generate(self, content: list, use_fallback: bool = False, user_logger: logging.Logger = None, stage: str = None) -> dict:
         """
@@ -99,19 +109,29 @@ class GeminiClient:
         Returns: dict: {status, text/message, model}
         """
         model_name = self._fallback_model_name if use_fallback else self._primary_model_name
+        thinking_level = self._fallback_thinking_level if use_fallback else self._primary_thinking_level
+        if not use_fallback and stage == 'preprocess':
+            model_name = self._preprocess_model_name
+            thinking_level = self._preprocess_thinking_level
+        started_at = time.monotonic()
 
         try:
             response = await self._client.aio.models.generate_content(
                 model=model_name,
                 contents=content,
-                config=types.GenerateContentConfig(safety_settings=self.SAFETY_SETTINGS)
+                config=types.GenerateContentConfig(
+                    safety_settings=self.SAFETY_SETTINGS,
+                    thinking_config=types.ThinkingConfig(thinking_level=thinking_level) if thinking_level else None,
+                )
             )
 
-            input_tokens, output_tokens, cached_tokens = _extract_usage(response)
+            input_tokens, output_tokens, cached_tokens, thinking_tokens = _extract_usage(response)
             got_usage = getattr(response, 'usage_metadata', None) is not None
             if user_logger:
                 user_logger.info(_format_usage_line(
-                    stage, model_name, input_tokens, output_tokens, cached_tokens, ok=got_usage
+                    stage, model_name, input_tokens, output_tokens, cached_tokens, ok=got_usage,
+                    thinking_tokens=thinking_tokens, thinking_level=thinking_level,
+                    duration_ms=(time.monotonic() - started_at) * 1000,
                 ))
 
             status, result_text = self._parse_response(response, model_name, user_logger)
@@ -126,7 +146,10 @@ class GeminiClient:
         except Exception as e:
             error_msg = f"Исключение при вызове API ({model_name}): {str(e)}"
             if user_logger:
-                user_logger.info(_format_usage_line(stage, model_name, 0, 0, 0, ok=False))
+                user_logger.info(_format_usage_line(
+                    stage, model_name, 0, 0, 0, ok=False, thinking_level=thinking_level,
+                    duration_ms=(time.monotonic() - started_at) * 1000,
+                ))
                 user_logger.error(error_msg)
             return {"status": "ERROR", "message": error_msg, "model": model_name}
     
@@ -247,7 +270,11 @@ def initialize_backend(logs_dir_path: str):
         api_key=API_KEY,
         primary_model=PRIMARY_GENERATIVE_MODEL_NAME,
         fallback_model=FALLBACK_GENERATIVE_MODEL_NAME,
-        embedding_model=EMBEDDING_MODEL_NAME
+        embedding_model=EMBEDDING_MODEL_NAME,
+        preprocess_model=os.getenv('PREPROCESS_GENERATIVE_MODEL'),
+        preprocess_thinking_level=os.getenv('PREPROCESS_THINKING_LEVEL'),
+        primary_thinking_level=os.getenv('PRIMARY_THINKING_LEVEL'),
+        fallback_thinking_level=os.getenv('FALLBACK_THINKING_LEVEL'),
     )
     
     # --- Загрузка данных RAG ---
@@ -615,7 +642,7 @@ async def analyze_creative_flow(file_bytes=None, text_content="", file_path=None
         # DIAG-END
         # Определяем, какую модель использовать
         use_fallback = (model_to_use == 'fallback')
-        model_name_for_log = "Fallback (Flash)" if use_fallback else "Primary (Pro)"
+        model_name_for_log = "Fallback" if use_fallback else "Primary"
             
         user_logger.info(f"--- Начало анализа с использованием модели: {model_name_for_log} ---")
 
