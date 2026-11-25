@@ -8,7 +8,7 @@ import pytz
 import asyncio
 import re
 from datetime import datetime, time, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot, LinkPreviewOptions
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
@@ -265,6 +265,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "broadcast_send":
         await run_broadcast(query, context)
     elif query.data == "broadcast_cancel":
+        if not ADMIN_USER_ID or str(query.from_user.id) != ADMIN_USER_ID:
+            return
+        if context.bot_data.get('broadcast_confirmation_id') == query.message.message_id:
+            context.bot_data.pop('broadcast_confirmation_id', None)
         await query.edit_message_text("Рассылка отменена.")
 
 LIMIT_TEXT = "Лимит на сегодня исчерпан. Спасибо за доверие, буду рад помочь завтра!"
@@ -874,18 +878,15 @@ async def touch_heartbeat():
 # БЛОК 5: РАЗОВАЯ РАССЫЛКА
 # ===============================================================
 
-BROADCAST_PHOTO_PATH = 'data/broadcast.jpg'
+BROADCAST_TEXT = """Всем привет! Я с двумя небольшими новостями.
 
-# Подпись к фото в Telegram — не длиннее 1024 символов (теги HTML не считаются).
-BROADCAST_TEXT = """Всем привет!
+Google недавно обновил свой парк моделей, и теперь за анализ рекламных креативов у нас здесь отвечает Gemini 4 Hydrogen, а Gemini 3.1 Pro будет на подхвате.
 
-Этот бот существует уже больше года. За это время им воспользовалось более пятисот человек, для десятков из вас он стал постоянным помощником в работе. Появились смежные проекты, такие же некоммерческие: <a href="https://search.delay-rag.ru">сервис поиска практики ФАС</a> и <a href="https://blog.delay-rag.ru/mcp-konniektor-k-poisku-po-praktikie-fas/">MCP-коннектор</a> к нему. С двумя крупными коммерческими компаниями мы приземлили бота на их внутренние процессы согласования креативов.
+А ещё недавно я подготовила большой обзор практики ФАС по рекламе по 6+ тысяч решений за прошедшие 5 лет. Узнайте, какие нарушения и нарушители встречаются чаще всего, что происходит в отдельных отраслях и регионах, какие рекламные ситуации повторяются — в графиках и кластерных картах. Обзор доступен в интерактивном формате, а также в PDF.
 
-Этой первой (и очень-очень редкой, обещаю) рассылкой я бы хотела анонсировать большой пакет изменений в честь первого Дня рождения проекта: анализ ваших креативов с ним станет ещё глубже и достовернее.
+<a href="https://delay-rag.ru/FAS-practice-report/">Открыть обзор практики ФАС</a>
 
-Бот остаётся некоммерческим на тех же условиях, что и весь этот год. Ваше доверие и тёплая обратная связь — это лучшая благодарность для автора.
-
-<i>delay-rag.ru · <a href="https://t.me/delay_RAG">TG-канал «Делай RAG»</a></i>"""
+Спасибо, что пользуетесь ботом!"""
 
 
 def get_broadcast_user_ids() -> list[int]:
@@ -913,18 +914,14 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.warning(f"Попытка несанкционированного доступа к команде /broadcast от пользователя {update.effective_user.id}")
         return
 
-    if not os.path.exists(BROADCAST_PHOTO_PATH):
-        await update.message.reply_text(f"Картинка для рассылки не найдена: {BROADCAST_PHOTO_PATH}")
-        return
-
-    with open(BROADCAST_PHOTO_PATH, 'rb') as photo:
-        preview = await update.message.reply_photo(photo, caption=BROADCAST_TEXT, parse_mode=ParseMode.HTML)
-
-    # file_id из предпросмотра переиспользуем в рассылке: картинка уедет на серверы Telegram один раз
-    context.bot_data['broadcast_file_id'] = preview.photo[-1].file_id
+    context.bot_data.pop('broadcast_confirmation_id', None)
+    await update.message.reply_text(
+        BROADCAST_TEXT, parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
     total = len(get_broadcast_user_ids())
-    await update.message.reply_text(
+    confirmation = await update.message.reply_text(
         f"👆 Так рассылку увидят получатели. Адресатов: <b>{total}</b>.",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([
@@ -932,6 +929,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             [InlineKeyboardButton("Отмена", callback_data="broadcast_cancel")],
         ])
     )
+    context.bot_data['broadcast_confirmation_id'] = confirmation.message_id
 
 
 async def run_broadcast(query, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -939,24 +937,30 @@ async def run_broadcast(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ADMIN_USER_ID or str(query.from_user.id) != ADMIN_USER_ID:
         return
 
-    file_id = context.bot_data.get('broadcast_file_id')
-    if not file_id:
+    if context.bot_data.get('broadcast_confirmation_id') != query.message.message_id:
         await query.edit_message_text("Предпросмотр устарел, сделайте /broadcast заново.")
         return
 
-    # Кнопку убираем сразу: второе нажатие отправило бы рассылку дважды
+    # Подтверждение погашаем до первого await: повторное нажатие не запустит вторую рассылку.
+    context.bot_data.pop('broadcast_confirmation_id', None)
     await query.edit_message_text("📣 Рассылка пошла…")
 
     sent = blocked = failed = 0
     for user_id in get_broadcast_user_ids():
         try:
-            await context.bot.send_photo(user_id, file_id, caption=BROADCAST_TEXT, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(
+                user_id, BROADCAST_TEXT, parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
             sent += 1
         except telegram.error.RetryAfter as e:
             # Уперлись в лимит Telegram — ждём столько, сколько просит, и пробуем этого же адресата ещё раз
             await asyncio.sleep(e.retry_after)
             try:
-                await context.bot.send_photo(user_id, file_id, caption=BROADCAST_TEXT, parse_mode=ParseMode.HTML)
+                await context.bot.send_message(
+                    user_id, BROADCAST_TEXT, parse_mode=ParseMode.HTML,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
                 sent += 1
             except Exception as retry_error:
                 failed += 1
